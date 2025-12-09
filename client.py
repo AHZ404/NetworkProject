@@ -1,4 +1,5 @@
 # client.py
+import math
 import socket
 import time
 import struct
@@ -33,6 +34,11 @@ class Client:
         self.seq_num = 0
         self.local_seq = 0  # Local sequence for logging
 
+        # Event system (only STAR events now)
+        self.events = {}  # event_id -> event_data
+        self.player_events = {}  # player_id -> event_data
+        self.event_pulse_time = 0.0
+
         # Logging
         self.log_file = open('client_log.txt', 'w')
         self.position_log = None
@@ -42,7 +48,7 @@ class Client:
 
     def _get_timestamp(self):
         """Get current timestamp in the format: YYYY-MM-DD HH:MM:SS,SSS"""
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        return datetime.now().strftime("%Y-%m-d %H:%M:%S,%f")[:-3]
 
     def log(self, msg, prefix="[CLIENT]"):
         """Enhanced logging with timestamp and client identifier"""
@@ -144,6 +150,53 @@ class Client:
                     positions_bytes = payload[pos_start:]
                     self.game.update_from_snapshot(grid_bytes, positions_bytes)
 
+                    # Try to parse events from remaining payload
+                    remaining_bytes = len(payload) - (pos_start + len(positions_bytes))
+                    if remaining_bytes > 0:
+                        events_start = pos_start + len(positions_bytes)
+                        events_bytes = payload[events_start:]
+                        if len(events_bytes) > 0:
+                            # Parse events (grid events + player events)
+                            try:
+                                # Grid events
+                                num_events = events_bytes[0]
+                                idx = 1
+                                for _ in range(num_events):
+                                    if idx + 3 < len(events_bytes):
+                                        event_id = events_bytes[idx]
+                                        event_type = events_bytes[idx + 1]
+                                        row = events_bytes[idx + 2]
+                                        col = events_bytes[idx + 3]
+
+                                        # Only add if not already collected
+                                        if event_id not in self.events:
+                                            self.events[event_id] = {
+                                                'type': event_type,
+                                                'row': row,
+                                                'col': col,
+                                                'collected': False
+                                            }
+                                        idx += 4
+
+                                # Player events
+                                if idx < len(events_bytes):
+                                    num_player_events = events_bytes[idx]
+                                    idx += 1
+                                    for _ in range(num_player_events):
+                                        if idx + 5 < len(events_bytes):
+                                            player_id = events_bytes[idx]
+                                            event_type = events_bytes[idx + 1]
+                                            remaining_ms = struct.unpack('>I', events_bytes[idx + 2:idx + 6])[0]
+
+                                            expiration_time = time.time() + (remaining_ms / 1000.0)
+                                            self.player_events[player_id] = {
+                                                'type': event_type,
+                                                'expiration_time': expiration_time
+                                            }
+                                            idx += 6
+                            except:
+                                pass  # Silently ignore parsing errors
+
                     # Update display positions targets
                     game_state = self.game.get_state()
                     for pid, pos in game_state['players'].items():
@@ -154,8 +207,20 @@ class Client:
                     player_count = len(game_state['players'])
                     grid_filled = sum(cell != 0 for row in game_state['grid'] for cell in row)
                     total_cells = self.game.grid_size * self.game.grid_size
+                    active_events = len([e for e in self.events.values() if not e['collected']])
+
+                    # Show scores progress
+                    scores_info = []
+                    for pid in range(1, 5):
+                        if pid in game_state['scores']:
+                            score = game_state['scores'][pid]
+                            scores_info.append(f"P{pid}={score}")
+                            if pid == self.player_id and score >= 180:
+                                self.log(f"ALERT: You have {score} blocks! Close to winning!")
+
                     self.log(
-                        f"<<< Received SNAPSHOT seq={seq_num}: players={player_count}, grid_filled={grid_filled}/{total_cells}")
+                        f"<<< Received SNAPSHOT seq={seq_num}: players={player_count}, scores: {', '.join(scores_info)}, "
+                        f"grid_filled={grid_filled}/{total_cells}, events={active_events}")
 
                     # Log metrics
                     if self.metric_file:
@@ -163,6 +228,45 @@ class Client:
                             f"{self.player_id},{snapshot_id},{seq_num},{timestamp},"
                             f"{recv_time},{latency},{jitter}\n")
                         self.metric_file.flush()
+
+                elif msg_type == MSG_TYPES['EVENT_SPAWN']:
+                    if len(payload) >= 4:
+                        event_id, event_type, row, col = struct.unpack('BBBB', payload[:4])
+                        event_name = "Star"
+                        self.log(f"Event spawned: {event_name} at ({row},{col})")
+
+                        # Store event for rendering
+                        self.events[event_id] = {
+                            'type': event_type,
+                            'row': row,
+                            'col': col,
+                            'collected': False
+                        }
+
+                elif msg_type == MSG_TYPES['EVENT_COLLECT']:
+                    if len(payload) >= 4:
+                        event_id, event_type, player_id, _ = struct.unpack('BBBB', payload[:4])
+                        event_name = "Star"
+
+                        if event_id in self.events:
+                            self.events[event_id]['collected'] = True
+                            # Don't delete immediately, let it fade out
+
+                        effect = "can steal enemy blocks"
+                        self.log(f"Player {player_id} collected {event_name} event - {effect}")
+
+                        # Update player events
+                        duration = 3.0
+                        self.player_events[player_id] = {
+                            'type': event_type,
+                            'expiration_time': time.time() + duration
+                        }
+
+                        # If it's our player, show special message
+                        if player_id == self.player_id:
+                            print(f"\n★ ★ ★ YOU COLLECTED STAR EVENT! ★ ★ ★")
+                            print("You can now steal enemy blocks by moving over them for 3 seconds!")
+                            print("★" * 50 + "\n")
 
                 elif msg_type == MSG_TYPES['ACK']:
                     if len(payload) >= 2:
@@ -177,14 +281,24 @@ class Client:
                     self.pending_claim = False
 
                 elif msg_type == MSG_TYPES['GAME_OVER']:
-                    if len(payload) == 5:
-                        winner, score1, score2, score3, score4 = struct.unpack('BBBBB', payload)
-                        self.log(
-                            f"Received GAME_OVER seq={seq_num}: winner=Player{winner}, scores=[P1={score1}, P2={score2}, P3={score3}, P4={score4}]")
-                        print(f"\n{'=' * 50}")
-                        print(f"GAME OVER! Winner: Player {winner}")
-                        print(f"Final Scores: P1={score1}, P2={score2}, P3={score3}, P4={score4}")
-                        print(f"{'=' * 50}\n")
+                    if len(payload) >= 6:
+                        winner = payload[0]
+                        win_reason_len = payload[1]
+                        win_reason = ""
+                        if win_reason_len > 0 and len(payload) >= 2 + win_reason_len + 4:
+                            win_reason = payload[2:2 + win_reason_len].decode('utf-8', errors='ignore')
+                            score_start = 2 + win_reason_len
+                            if len(payload) >= score_start + 4:
+                                score1, score2, score3, score4 = struct.unpack('BBBB',
+                                                                               payload[score_start:score_start + 4])
+                                self.log(
+                                    f"Received GAME_OVER seq={seq_num}: winner=Player{winner}, reason={win_reason}, "
+                                    f"scores=[P1={score1}, P2={score2}, P3={score3}, P4={score4}]")
+                                print(f"\n{'=' * 50}")
+                                print(f"GAME OVER! Winner: Player {winner}")
+                                print(f"Reason: {win_reason}")
+                                print(f"Final Scores: P1={score1}, P2={score2}, P3={score3}, P4={score4}")
+                                print(f"{'=' * 50}\n")
                     self.running = False
 
             except Exception as e:
@@ -245,6 +359,7 @@ class Client:
         smoothing_speed = 5.0
         font = pygame.font.Font(None, 24)  # For text rendering
         small_font = pygame.font.Font(None, 18)  # Smaller font for stats
+        title_font = pygame.font.Font(None, 32)  # Larger font for titles
 
         # Connection timeout
         connection_start = time.time()
@@ -253,12 +368,35 @@ class Client:
         # Main loop
         while self.running:
             dt = clock.tick(60) / 1000.0
+            self.event_pulse_time += dt
 
             # Check connection timeout
             if not self.connected and time.time() - connection_start > connection_timeout:
                 self.log("Connection timeout - server not responding")
                 self.running = False
                 break
+
+            # Clean up expired player events
+            current_time = time.time()
+            expired_events = []
+            for pid, event_data in list(self.player_events.items()):
+                if current_time > event_data['expiration_time']:
+                    expired_events.append(pid)
+
+            for pid in expired_events:
+                if pid in self.player_events:
+                    del self.player_events[pid]
+                    if pid == self.player_id:
+                        self.log("Star effect expired")
+
+            # Clean up collected events (after a delay)
+            events_to_remove = []
+            for event_id, event_data in list(self.events.items()):
+                if event_data['collected'] and current_time - event_data.get('collected_time', current_time) > 1.0:
+                    events_to_remove.append(event_id)
+
+            for event_id in events_to_remove:
+                del self.events[event_id]
 
             # Handle input
             for event in pygame.event.get():
@@ -319,8 +457,10 @@ class Client:
             for pid, target_pos in game_state['players'].items():
                 if pid in self.display_positions:
                     current_pos = self.display_positions[pid]
+                    speed = smoothing_speed
+
                     new_pos = GridClashGame.interpolate_position(
-                        current_pos, target_pos, smoothing_speed, dt)
+                        current_pos, target_pos, speed, dt)
                     self.display_positions[pid] = new_pos
                 else:
                     self.display_positions[pid] = (float(target_pos[0]), float(target_pos[1]))
@@ -357,6 +497,39 @@ class Client:
                                  (i * CELL_SIZE, 0),
                                  (i * CELL_SIZE, grid_size * CELL_SIZE), 1)
 
+            # Draw special events on grid (only STAR events now)
+            pulse = (math.sin(self.event_pulse_time * 5) + 1) * 0.5  # 0 to 1 pulsation
+            for event_id, event_data in self.events.items():
+                if not event_data['collected']:
+                    row, col = event_data['row'], event_data['col']
+
+                    # Star event color (gold with pulse)
+                    base_color = (255, 215, 0)  # Gold
+                    pulse_color = (255, 255, 200)  # Light gold for pulse
+
+                    # Blend colors for pulse effect
+                    color = (
+                        int(base_color[0] * (1 - pulse) + pulse_color[0] * pulse),
+                        int(base_color[1] * (1 - pulse) + pulse_color[1] * pulse),
+                        int(base_color[2] * (1 - pulse) + pulse_color[2] * pulse)
+                    )
+
+                    # Draw event as a star in the cell
+                    center_x = col * CELL_SIZE + CELL_SIZE / 2
+                    center_y = row * CELL_SIZE + CELL_SIZE / 2
+
+                    # Draw a star shape
+                    radius = int(CELL_SIZE / 4)
+                    points = []
+                    for i in range(5):
+                        angle = math.pi / 2 + i * 4 * math.pi / 5
+                        outer_x = center_x + radius * math.cos(angle)
+                        outer_y = center_y + radius * math.sin(angle)
+                        inner_x = center_x + (radius / 2) * math.cos(angle + 2 * math.pi / 10)
+                        inner_y = center_y + (radius / 2) * math.sin(angle + 2 * math.pi / 10)
+                        points.extend([(outer_x, outer_y), (inner_x, inner_y)])
+                    pygame.draw.polygon(screen, color, points)
+
             # Draw players with outlines when on claimed cells
             for pid, (row, col) in self.display_positions.items():
                 # Get player color
@@ -385,6 +558,17 @@ class Client:
                                        (int(center_x), int(center_y)),
                                        radius + 3, 3)  # 3 pixel thick outline
 
+                # Draw event indicator on player if they have an active star event
+                if pid in self.player_events:
+                    event_type = self.player_events[pid]['type']
+                    if event_type == 1:  # Star
+                        # Draw small star above player
+                        star_radius = int(CELL_SIZE / 8)
+                        star_y = center_y - radius - star_radius - 2
+                        pygame.draw.circle(screen, (255, 215, 0),
+                                           (int(center_x), int(star_y)),
+                                           star_radius)
+
             # Draw player info and status
             if self.player_id:
                 # Show which player you are
@@ -392,10 +576,17 @@ class Client:
                 player_text = font.render(f"You: Player {self.player_id}", True, player_color)
                 screen.blit(player_text, (5, 5))
 
-                # Show current score
+                # Show current score and win condition
                 scores = game_state['scores']
-                score_text = font.render(f"Score: {scores.get(self.player_id, 0)}", True, (255, 255, 255))
+                your_score = scores.get(self.player_id, 0)
+                score_text = font.render(f"Score: {your_score}/200", True, (255, 255, 255))
                 screen.blit(score_text, (5, 30))
+
+                # Show progress towards win
+                progress = min(your_score / 200, 1.0)
+                progress_width = int(progress * 100)
+                pygame.draw.rect(screen, (100, 100, 100), (5, 55, 100, 10))
+                pygame.draw.rect(screen, (0, 255, 0), (5, 55, progress_width, 10))
 
                 # Show cell status
                 cell_status = self.game.get_player_cell_status(self.player_id)
@@ -411,23 +602,54 @@ class Client:
                     status_color = (200, 200, 255)  # Light blue
 
                 status_surface = font.render(status_text, True, status_color)
-                screen.blit(status_surface, (5, 55))
+                screen.blit(status_surface, (5, 70))
 
-                # Show movement rules reminder
-                rules_text = small_font.render("NEW: Can move through YOUR claimed cells", True, (200, 200, 100))
-                screen.blit(rules_text, (5, grid_size * CELL_SIZE - 70))
+                # Show active event status
+                if self.player_id in self.player_events:
+                    event_data = self.player_events[self.player_id]
+                    event_type = event_data['type']
+                    remaining_time = max(0, event_data['expiration_time'] - current_time)
+
+                    event_name = "STAR POWER"
+                    event_color = (255, 215, 0)
+                    effect_desc = "Steal enemy blocks by moving over them"
+
+                    # Event status
+                    event_status = font.render(f"{event_name}: {remaining_time:.1f}s", True, event_color)
+                    screen.blit(event_status, (5, 95))
+
+                    # Effect description
+                    effect_text = small_font.render(effect_desc, True, (200, 200, 100))
+                    screen.blit(effect_text, (5, 120))
+
+                # Show game rules reminder
+                rules_y = grid_size * CELL_SIZE - 110
+                rules_text = small_font.render("NEW RULES:", True, (200, 200, 100))
+                screen.blit(rules_text, (5, rules_y))
+
+                rule1_y = grid_size * CELL_SIZE - 90
+                rule1_text = small_font.render("1. Can move through YOUR claimed cells", True, (200, 200, 100))
+                screen.blit(rule1_text, (5, rule1_y))
+
+                rule2_y = grid_size * CELL_SIZE - 70
+                rule2_text = small_font.render("2. First to 200 blocks WINS!", True, (200, 200, 100))
+                screen.blit(rule2_text, (5, rule2_y))
+
+                rule3_y = grid_size * CELL_SIZE - 50
+                rule3_text = small_font.render("3. ★ Star: Steal enemy cells (3s)", True, (255, 215, 0))
+                screen.blit(rule3_text, (5, rule3_y))
 
                 # Show controls reminder
                 controls_text = small_font.render("Controls: Arrow Keys = Move, SPACE = Claim, ESC = Quit", True,
                                                   (200, 200, 200))
-                screen.blit(controls_text, (5, grid_size * CELL_SIZE - 45))
+                screen.blit(controls_text, (5, grid_size * CELL_SIZE - 25))
 
                 # Show connection status
                 if self.connected:
                     conn_text = small_font.render(f"Connected as {self.client_name}", True, (0, 255, 0))
                 else:
                     conn_text = small_font.render("Connecting to server...", True, (255, 255, 0))
-                screen.blit(conn_text, (5, grid_size * CELL_SIZE - 20))
+                screen.blit(conn_text, (5, grid_size * CELL_SIZE - 10))
 
             # Show game over message
             if game_state['game_over']:
@@ -436,10 +658,15 @@ class Client:
                 screen.blit(overlay, (0, 0))
 
                 winner = game_state['winner']
+                win_reason = game_state.get('win_reason', 'Game ended')
                 winner_color = GridClashGame.get_color(winner)
-                winner_text = font.render(f"GAME OVER! Winner: Player {winner}", True, winner_color)
-                winner_rect = winner_text.get_rect(center=(grid_size * CELL_SIZE // 2, grid_size * CELL_SIZE // 2 - 30))
+                winner_text = title_font.render(f"GAME OVER! Winner: Player {winner}", True, winner_color)
+                winner_rect = winner_text.get_rect(center=(grid_size * CELL_SIZE // 2, grid_size * CELL_SIZE // 2 - 50))
                 screen.blit(winner_text, winner_rect)
+
+                reason_text = font.render(f"Reason: {win_reason}", True, (255, 255, 255))
+                reason_rect = reason_text.get_rect(center=(grid_size * CELL_SIZE // 2, grid_size * CELL_SIZE // 2 - 20))
+                screen.blit(reason_text, reason_rect)
 
                 scores_text = font.render(
                     f"Scores: P1={game_state['scores'].get(1, 0)} | "
