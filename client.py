@@ -412,20 +412,31 @@ class Client:
                     self.log(f"Receive error: {e}")
 
     def auto_input_thread(self):
-        """Auto bot thread"""
-        while self.running and self.connected:
-            time.sleep(random.uniform(0.2, 0.8))  # Slower auto inputs
+        """Auto bot thread with guaranteed heartbeats"""
+        last_heartbeat = time.time()
 
+        while self.running and self.connected:
+            current_time = time.time()
+
+            # Send heartbeat every 2 seconds
+            if current_time - last_heartbeat > 2.0:
+                self.send_heartbeat()
+                last_heartbeat = current_time
+
+            # Send random input
             self.seq_num += 1
 
-            if random.random() < 0.7:  # 70% move, 30% claim
+            if random.random() < 0.7:  # 70% move
                 direction = random.choice([0, 1, 2, 3])
                 self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num,
-                                  struct.pack('B', direction), reliable=True)
-            else:
-                self.send_message(MSG_TYPES['CLAIM'], 0, self.seq_num, b'', reliable=True)
+                                  struct.pack('B', direction))
+            else:  # 30% claim
+                self.send_message(MSG_TYPES['CLAIM'], 0, self.seq_num, b'')
                 self.pending_claim = True
                 self.claim_timer = self.claim_timeout
+
+            # Random delay between 0.3-0.8 seconds
+            time.sleep(random.uniform(0.3, 0.8))
 
     def get_fps(self):
         """Calculate current FPS"""
