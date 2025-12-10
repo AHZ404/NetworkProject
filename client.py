@@ -7,51 +7,81 @@ import threading
 import sys
 import random
 import pygame
+import zlib
 from datetime import datetime
+from collections import deque
 from common import *
-from game import GridClashGame  # Import consolidated game logic
+from game import GridClashGame
 
 
 class Client:
     def __init__(self, host=HOST, port=PORT, auto=False, client_name=None):
+        # Network setup
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
         self.sock.bind(('', 0))
+        self.sock.settimeout(0.01)  # Non-blocking with timeout
+
         self.server_addr = (host, port)
 
-        # Game instance for local state
+        # Game instance
         self.game = GridClashGame()
         self.player_id = None
-        self.display_positions = {}  # Smoothed positions for rendering
-        self.client_name = client_name or f"Client_{random.randint(100, 999)}"
+        self.display_positions = {}
 
         # Client state
+        self.client_name = client_name or f"Client_{random.randint(100, 999)}"
         self.snapshot_id = 0
         self.pending_claim = False
         self.claim_timer = 0.0
-        self.claim_timeout = 0.2
+        self.claim_timeout = 0.5  # Increased timeout
         self.running = True
         self.auto = auto
         self.seq_num = 0
-        self.local_seq = 0  # Local sequence for logging
+        self.local_seq = 0
 
-        # Event system (only STAR events now)
-        self.events = {}  # event_id -> event_data
-        self.player_events = {}  # player_id -> event_data
+        # Sequence and reliability
+        self.seq_manager = SequenceManager()
+        self.pending_snapshots = {}
+        self.last_server_seq = 0
+
+        # Event system
+        self.events = {}
+        self.player_events = {}
         self.event_pulse_time = 0.0
+
+        # Prediction and reconciliation
+        self.input_buffer = deque(maxlen=60)  # Store last 1 second of inputs at 60Hz
+        self.predicted_state = None
+        self.prediction_seq = 0
+        self.reconciliation_buffer = deque(maxlen=30)
+
+        # Connection monitoring
+        self.connected = False
+        self.connection_start = 0
+        self.connection_timeout = 10.0
+        self.avg_latency = 0
+        self.packet_loss = 0
+        self.last_heartbeat_time = 0
+        self.heartbeat_interval = 2.0
 
         # Logging
         self.log_file = open('client_log.txt', 'w')
         self.position_log = None
         self.metric_file = None
         self.last_recv_time = 0
-        self.connected = False
+        self.last_snapshot_time = 0
+
+        # Performance tracking
+        self.frame_times = deque(maxlen=60)
+        self.update_times = deque(maxlen=60)
+        self.render_times = deque(maxlen=60)
 
     def _get_timestamp(self):
-        """Get current timestamp in the format: YYYY-MM-DD HH:MM:SS,SSS"""
-        return datetime.now().strftime("%Y-%m-d %H:%M:%S,%f")[:-3]
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
 
     def log(self, msg, prefix="[CLIENT]"):
-        """Enhanced logging with timestamp and client identifier"""
         timestamp = self._get_timestamp()
         if self.player_id:
             log_prefix = f"[CLIENT {self.player_id:03d}]"
@@ -59,291 +89,375 @@ class Client:
             log_prefix = f"[CLIENT {self.client_name}]"
 
         full_msg = f"{timestamp} - {log_prefix} {msg}"
-        print(full_msg)  # Also print to console
+        print(full_msg)
         self.log_file.write(full_msg + "\n")
         self.log_file.flush()
 
-    def send_message(self, msg_type, snapshot_id, seq_num, payload=b''):
-        timestamp = int(time.time() * 1000)
-        payload_len = len(payload)
-        checksum = compute_checksum(payload)
-        header = struct.pack(HEADER_FMT, PROTO_ID, VERSION, msg_type,
-                             snapshot_id, seq_num, timestamp, payload_len, checksum)
-        data = header + payload
-        self.sock.sendto(data, self.server_addr)
 
-        # Enhanced logging for sent messages
-        if msg_type == MSG_TYPES['CONNECT']:
-            self.log(f"Sent CONNECT seq={self.local_seq}")
-            self.local_seq += 1
-        elif msg_type == MSG_TYPES['MOVE']:
-            direction = struct.unpack('B', payload)[0] if payload else -1
-            dir_names = {0: 'UP', 1: 'DOWN', 2: 'LEFT', 3: 'RIGHT'}
-            direction_name = dir_names.get(direction, 'UNKNOWN')
-            self.log(f"Sent MOVE seq={self.local_seq}: direction={direction_name} ({direction})")
-            self.local_seq += 1
-        elif msg_type == MSG_TYPES['CLAIM']:
-            self.log(f"Sent CLAIM seq={self.local_seq}")
-            self.local_seq += 1
+    def send_message(self, msg_type, snapshot_id, seq_num, payload=b'', reliable=False):
+        """Send message with optional reliability"""
+        try:
+            # DEBUG: Always print what we're sending
+            msg_names = {v: k for k, v in MSG_TYPES.items()}
+            msg_name = msg_names.get(msg_type, f"UNKNOWN({msg_type})")
+            self.log(f"DEBUG: Preparing to send {msg_name}")
 
-    def receive_thread(self):
-        while self.running:
-            try:
-                data, addr = self.sock.recvfrom(2048)
-                if addr != self.server_addr or len(data) < HEADER_SIZE:
-                    continue
+            if reliable:
+                self.seq_manager.packet_sent(seq_num)
 
-                header = data[:HEADER_SIZE]
-                protocol_id, version, msg_type, snapshot_id, seq_num, timestamp, payload_len, checksum = struct.unpack(
-                    HEADER_FMT, header)
+            # Don't compress CONNECT/WELCOME messages
+            if len(payload) > 100 and msg_type not in [MSG_TYPES['HEARTBEAT'], MSG_TYPES['CONNECT'],
+                                                       MSG_TYPES['WELCOME']]:
+                compressed = zlib.compress(payload, level=1)
+                if len(compressed) < len(payload):
+                    payload = compressed
+                    msg_type = MSG_TYPES['COMPRESSED']
 
-                if protocol_id != PROTO_ID or version != VERSION or payload_len != len(data) - HEADER_SIZE:
-                    continue
+            timestamp = int(time.time() * 1000)
+            payload_len = len(payload)
+            checksum = compute_checksum(payload)
 
-                payload = data[HEADER_SIZE:]
-                if compute_checksum(payload) != checksum:
-                    continue
+            # DEBUG: Print checksum
+            self.log(f"DEBUG: Checksum for payload ({payload_len} bytes): {checksum}")
 
-                # Process latency and jitter
-                recv_time = int(time.time() * 1000)
-                latency = recv_time - timestamp
-                curr_time = time.time()
-                jitter = 0
-                if self.last_recv_time > 0 and msg_type == MSG_TYPES['SNAPSHOT']:
-                    inter_arrival = curr_time - self.last_recv_time
-                    jitter = abs(inter_arrival - UPDATE_INTERVAL)
-                self.last_recv_time = curr_time
+            header = create_header(msg_type, snapshot_id, seq_num, payload_len, checksum)
+            data = header + payload
 
-                # Handle different message types with enhanced logging
-                if msg_type == MSG_TYPES['WELCOME'] and len(payload) == 2:
-                    self.player_id, grid_size = struct.unpack('BB', payload)
-                    self.connected = True
-                    self.log(f"Received WELCOME seq={seq_num}: player_id={self.player_id}, grid_size={grid_size}")
+            self.log(f"DEBUG: Sending {len(data)} bytes total (header: {len(header)}, payload: {payload_len})")
 
-                    # Game already initialized with correct grid size
-                    self.position_log = open(f'client_{self.player_id}_position_log.csv', 'w')
-                    self.position_log.write('time,snapshot_id,player_id,row,col\n')
-                    self.metric_file = open(f'client_{self.player_id}_metrics.csv', 'w')
-                    self.metric_file.write('client_id,snapshot_id,seq_num,server_timestamp,recv_time,latency,jitter\n')
+            # DEBUG: Print first few bytes
+            if len(data) > 0:
+                self.log(f"DEBUG: First 4 bytes: {data[:4].hex() if len(data) >= 4 else 'too short'}")
 
-                elif msg_type == MSG_TYPES['SNAPSHOT']:
-                    if snapshot_id <= self.snapshot_id:
-                        continue  # Discard outdated
-                    self.snapshot_id = snapshot_id
+            bytes_sent = self.sock.sendto(data, self.server_addr)
+            self.log(f"DEBUG: Sent {bytes_sent} bytes to {self.server_addr}")
 
-                    # Handle redundant payload (contains current + previous)
-                    payload_size = len(payload)
-                    grid_size = self.game.grid_size * self.game.grid_size
+            # Log important messages
+            if msg_type == MSG_TYPES['CONNECT']:
+                self.log(f"Sent CONNECT seq={self.local_seq}")
+                self.local_seq += 1
 
-                    # Extract the most recent snapshot (last half of payload if redundant)
-                    if payload_size >= grid_size * 2:
-                        # Has redundancy, use the second (newer) snapshot
-                        start_idx = payload_size // 2
-                        grid_bytes = payload[start_idx:start_idx + grid_size]
-                        pos_start = start_idx + grid_size
-                    else:
-                        # No redundancy
-                        grid_bytes = payload[:grid_size]
-                        pos_start = grid_size
+        except Exception as e:
+            self.log(f"Send error: {e}")
+            import traceback
+            self.log(f"Traceback: {traceback.format_exc()}")
 
-                    # Update game state
-                    positions_bytes = payload[pos_start:]
-                    self.game.update_from_snapshot(grid_bytes, positions_bytes)
+    def predict_move(self, direction):
+        """Predict move locally for immediate feedback"""
+        if not self.player_id:
+            return
 
-                    # Try to parse events from remaining payload
-                    remaining_bytes = len(payload) - (pos_start + len(positions_bytes))
-                    if remaining_bytes > 0:
-                        events_start = pos_start + len(positions_bytes)
-                        events_bytes = payload[events_start:]
-                        if len(events_bytes) > 0:
-                            # Parse events (grid events + player events)
-                            try:
-                                # Grid events
-                                num_events = events_bytes[0]
-                                idx = 1
-                                for _ in range(num_events):
-                                    if idx + 3 < len(events_bytes):
-                                        event_id = events_bytes[idx]
-                                        event_type = events_bytes[idx + 1]
-                                        row = events_bytes[idx + 2]
-                                        col = events_bytes[idx + 3]
+        # Store input for reconciliation
+        input_record = {
+            'seq': self.seq_num,
+            'direction': direction,
+            'timestamp': time.time(),
+            'position_before': self.game.players.get(self.player_id, (0, 0))
+        }
 
-                                        # Only add if not already collected
-                                        if event_id not in self.events:
-                                            self.events[event_id] = {
-                                                'type': event_type,
-                                                'row': row,
-                                                'col': col,
-                                                'collected': False
-                                            }
-                                        idx += 4
+        self.input_buffer.append(input_record)
 
-                                # Player events
-                                if idx < len(events_bytes):
-                                    num_player_events = events_bytes[idx]
-                                    idx += 1
-                                    for _ in range(num_player_events):
-                                        if idx + 5 < len(events_bytes):
-                                            player_id = events_bytes[idx]
-                                            event_type = events_bytes[idx + 1]
-                                            remaining_ms = struct.unpack('>I', events_bytes[idx + 2:idx + 6])[0]
+        # Apply prediction
+        if self.predicted_state is None:
+            self.predicted_state = self.game.get_state()
 
-                                            expiration_time = time.time() + (remaining_ms / 1000.0)
-                                            self.player_events[player_id] = {
-                                                'type': event_type,
-                                                'expiration_time': expiration_time
-                                            }
-                                            idx += 6
-                            except:
-                                pass  # Silently ignore parsing errors
+        # Simple prediction: move in direction
+        game_state = self.game.get_state()
+        if self.player_id in game_state['players']:
+            row, col = game_state['players'][self.player_id]
 
-                    # Update display positions targets
-                    game_state = self.game.get_state()
-                    for pid, pos in game_state['players'].items():
-                        if pid not in self.display_positions:
-                            self.display_positions[pid] = (float(pos[0]), float(pos[1]))
+            # Calculate new position
+            new_row, new_col = row, col
+            if direction == 0 and row > 0:
+                new_row = row - 1
+            elif direction == 1 and row < self.game.grid_size - 1:
+                new_row = row + 1
+            elif direction == 2 and col > 0:
+                new_col = col - 1
+            elif direction == 3 and col < self.game.grid_size - 1:
+                new_col = col + 1
 
-                    # Log snapshot receipt
-                    player_count = len(game_state['players'])
-                    grid_filled = sum(cell != 0 for row in game_state['grid'] for cell in row)
-                    total_cells = self.game.grid_size * self.game.grid_size
-                    active_events = len([e for e in self.events.values() if not e['collected']])
+            # Update predicted state
+            if self.predicted_state:
+                self.predicted_state['players'][self.player_id] = (new_row, new_col)
 
-                    # Show scores progress
-                    scores_info = []
-                    for pid in range(1, 5):
-                        if pid in game_state['scores']:
-                            score = game_state['scores'][pid]
-                            scores_info.append(f"P{pid}={score}")
-                            if pid == self.player_id and score >= 180:
-                                self.log(f"ALERT: You have {score} blocks! Close to winning!")
+    def reconcile_state(self, server_state):
+        """Reconcile predicted state with server state"""
+        if not self.predicted_state or not self.player_id:
+            return
 
-                    self.log(
-                        f"<<< Received SNAPSHOT seq={seq_num}: players={player_count}, scores: {', '.join(scores_info)}, "
-                        f"grid_filled={grid_filled}/{total_cells}, events={active_events}")
+        # Check if prediction matches server
+        server_pos = server_state['players'].get(self.player_id)
+        predicted_pos = self.predicted_state['players'].get(self.player_id)
 
-                    # Log metrics
-                    if self.metric_file:
-                        self.metric_file.write(
-                            f"{self.player_id},{snapshot_id},{seq_num},{timestamp},"
-                            f"{recv_time},{latency},{jitter}\n")
-                        self.metric_file.flush()
+        if server_pos and predicted_pos and server_pos != predicted_pos:
+            # Prediction was wrong, revert and replay inputs
+            self.log(f"Reconciliation needed: server={server_pos}, predicted={predicted_pos}")
 
-                elif msg_type == MSG_TYPES['EVENT_SPAWN']:
-                    if len(payload) >= 4:
-                        event_id, event_type, row, col = struct.unpack('BBBB', payload[:4])
-                        event_name = "Star"
-                        self.log(f"Event spawned: {event_name} at ({row},{col})")
+            # Revert to server state
+            self.predicted_state = server_state.copy()
 
-                        # Store event for rendering
-                        self.events[event_id] = {
-                            'type': event_type,
-                            'row': row,
-                            'col': col,
-                            'collected': False
-                        }
+            # Replay inputs that happened after this snapshot
+            for input_record in list(self.input_buffer):
+                # Only replay if input was after the server state
+                # (simplified - in real implementation, track timestamps)
+                pass
 
-                elif msg_type == MSG_TYPES['EVENT_COLLECT']:
-                    if len(payload) >= 4:
-                        event_id, event_type, player_id, _ = struct.unpack('BBBB', payload[:4])
-                        event_name = "Star"
+    def handle_packet(self, data, addr):
+        """Handle incoming packet"""
+        if len(data) < HEADER_SIZE:
+            return
 
-                        if event_id in self.events:
-                            self.events[event_id]['collected'] = True
-                            # Don't delete immediately, let it fade out
+        try:
+            header = parse_header(data[:HEADER_SIZE])
+            if not header:
+                return
 
-                        effect = "can steal enemy blocks"
-                        self.log(f"Player {player_id} collected {event_name} event - {effect}")
+            protocol_id, version, msg_type, snapshot_id, seq_num, timestamp, payload_len, checksum = header
 
-                        # Update player events
-                        duration = 3.0
-                        self.player_events[player_id] = {
-                            'type': event_type,
-                            'expiration_time': time.time() + duration
-                        }
+            if protocol_id != PROTO_ID or version != VERSION:
+                return
 
-                        # If it's our player, show special message
-                        if player_id == self.player_id:
-                            print(f"\n★ ★ ★ YOU COLLECTED STAR EVENT! ★ ★ ★")
-                            print("You can now steal enemy blocks by moving over them for 3 seconds!")
-                            print("★" * 50 + "\n")
+            payload = data[HEADER_SIZE:]
+            if len(payload) != payload_len:
+                return
 
-                elif msg_type == MSG_TYPES['ACK']:
-                    if len(payload) >= 2:
-                        row, col = struct.unpack('BB', payload[:2])
-                        self.log(f"Received ACK seq={seq_num}: claim_success at ({row},{col})")
-                    self.pending_claim = False
+            if compute_checksum(payload) != checksum:
+                return
 
-                elif msg_type == MSG_TYPES['NACK']:
-                    if len(payload) >= 2:
-                        row, col = struct.unpack('BB', payload[:2])
-                        self.log(f"Received NACK seq={seq_num}: claim_failed at ({row},{col})")
-                    self.pending_claim = False
+            # Handle compressed payload
+            if msg_type == MSG_TYPES['COMPRESSED']:
+                try:
+                    payload = zlib.decompress(payload)
+                    msg_type = MSG_TYPES['SNAPSHOT']
+                except:
+                    return
 
-                elif msg_type == MSG_TYPES['GAME_OVER']:
-                    if len(payload) >= 6:
-                        winner = payload[0]
-                        win_reason_len = payload[1]
-                        win_reason = ""
-                        if win_reason_len > 0 and len(payload) >= 2 + win_reason_len + 4:
-                            win_reason = payload[2:2 + win_reason_len].decode('utf-8', errors='ignore')
-                            score_start = 2 + win_reason_len
-                            if len(payload) >= score_start + 4:
-                                score1, score2, score3, score4 = struct.unpack('BBBB',
-                                                                               payload[score_start:score_start + 4])
-                                self.log(
-                                    f"Received GAME_OVER seq={seq_num}: winner=Player{winner}, reason={win_reason}, "
-                                    f"scores=[P1={score1}, P2={score2}, P3={score3}, P4={score4}]")
-                                print(f"\n{'=' * 50}")
-                                print(f"GAME OVER! Winner: Player {winner}")
-                                print(f"Reason: {win_reason}")
-                                print(f"Final Scores: P1={score1}, P2={score2}, P3={score3}, P4={score4}")
-                                print(f"{'=' * 50}\n")
+            # Calculate latency
+            recv_time = int(time.time() * 1000)
+            latency = recv_time - timestamp
+
+            # Update latency tracking
+            self.avg_latency = self.avg_latency * 0.9 + latency * 0.1
+
+            # Check for packet loss
+            missing = self.seq_manager.packet_received(seq_num)
+            if missing:
+                self.packet_loss = min(1.0, self.packet_loss * 0.9 + 0.1)
+                # Request missing packets
+                for missing_seq in missing[:3]:  # Limit to 3 requests
+                    self.send_message(MSG_TYPES['RESEND_REQUEST'], 0, 0,
+                                      struct.pack('I', missing_seq))
+            else:
+                self.packet_loss = self.packet_loss * 0.99
+
+            # Handle message type
+            if msg_type == MSG_TYPES['WELCOME'] and len(payload) == 2:
+                self.player_id, grid_size = struct.unpack('BB', payload)
+                self.connected = True
+                self.connection_start = time.time()
+
+                self.log(f"Connected as Player {self.player_id}")
+
+                # Open log files
+                self.position_log = open(f'client_{self.player_id}_position_log.csv', 'w')
+                self.position_log.write('time,snapshot_id,row,col,latency\n')
+                self.metric_file = open(f'client_{self.player_id}_metrics.csv', 'w')
+                self.metric_file.write('timestamp,snapshot_id,latency,packet_loss,fps\n')
+
+                # Send heartbeat immediately
+                self.send_heartbeat()
+
+            elif msg_type == MSG_TYPES['SNAPSHOT']:
+                # Acknowledge receipt
+                self.send_message(MSG_TYPES['ACK_SNAPSHOT'], snapshot_id, seq_num)
+
+                # Process snapshot
+                if snapshot_id > self.snapshot_id:
+                    self.process_snapshot(snapshot_id, seq_num, payload, latency)
+                    self.last_snapshot_time = time.time()
+
+            elif msg_type == MSG_TYPES['EVENT_SPAWN']:
+                if len(payload) >= 4:
+                    event_id, event_type, row, col = struct.unpack('BBBB', payload[:4])
+                    self.events[event_id] = {
+                        'type': event_type,
+                        'row': row,
+                        'col': col,
+                        'collected': False
+                    }
+
+            elif msg_type == MSG_TYPES['EVENT_COLLECT']:
+                if len(payload) >= 4:
+                    event_id, event_type, player_id, _ = struct.unpack('BBBB', payload[:4])
+                    if event_id in self.events:
+                        self.events[event_id]['collected'] = True
+                        self.events[event_id]['collected_time'] = time.time()
+
+                    if player_id == self.player_id:
+                        print(f"\n{'★' * 20}")
+                        print("YOU COLLECTED A STAR!")
+                        print("You can steal enemy blocks for 3 seconds!")
+                        print(f"{'★' * 20}\n")
+
+            elif msg_type == MSG_TYPES['ACK']:
+                self.pending_claim = False
+                if len(payload) >= 2:
+                    row, col = struct.unpack('BB', payload[:2])
+
+            elif msg_type == MSG_TYPES['NACK']:
+                self.pending_claim = False
+                self.log("Claim failed - cell already owned")
+
+            elif msg_type == MSG_TYPES['GAME_OVER']:
+                self.handle_game_over(payload)
+
+        except Exception as e:
+            self.log(f"Packet handling error: {e}")
+
+    def process_snapshot(self, snapshot_id, seq_num, payload, latency):
+        """Process incoming snapshot"""
+        # Update from delta
+        success = self.game.update_from_delta(payload)
+
+        if success:
+            self.snapshot_id = snapshot_id
+            self.last_server_seq = seq_num
+
+            # Reconcile with predicted state
+            server_state = self.game.get_state()
+            self.reconcile_state(server_state)
+
+            # Update display positions
+            for pid, pos in server_state['players'].items():
+                if pid not in self.display_positions:
+                    self.display_positions[pid] = (float(pos[0]), float(pos[1]))
+
+            # Log metrics
+            if self.metric_file and self.player_id:
+                current_time = time.time()
+                self.metric_file.write(
+                    f"{current_time},{snapshot_id},{latency},"
+                    f"{self.packet_loss:.3f},{self.get_fps():.1f}\n")
+                self.metric_file.flush()
+
+            # Log position
+            if self.position_log and self.player_id in self.display_positions:
+                row, col = self.display_positions[self.player_id]
+                self.position_log.write(
+                    f"{time.time()},{snapshot_id},{row},{col},{latency}\n")
+                self.position_log.flush()
+
+    def handle_game_over(self, payload):
+        """Handle game over message"""
+        if len(payload) >= 6:
+            winner = payload[0]
+            win_reason_len = payload[1]
+            win_reason = ""
+            if win_reason_len > 0:
+                win_reason = payload[2:2 + win_reason_len].decode('utf-8', errors='ignore')
+                score_start = 2 + win_reason_len
+                if len(payload) >= score_start + 4:
+                    scores = struct.unpack('BBBB', payload[score_start:score_start + 4])
+
+                    self.log(f"GAME OVER! Winner: Player {winner}, Reason: {win_reason}")
+                    print(f"\n{'=' * 50}")
+                    print(f"GAME OVER!")
+                    print(f"Winner: Player {winner}")
+                    print(f"Reason: {win_reason}")
+                    print(f"Final Scores: P1={scores[0]}, P2={scores[1]}, P3={scores[2]}, P4={scores[3]}")
+                    print(f"{'=' * 50}\n")
+
                     self.running = False
 
+    def send_heartbeat(self):
+        """Send heartbeat to server"""
+        if self.connected:
+            self.send_message(MSG_TYPES['HEARTBEAT'], 0, 0)
+            self.last_heartbeat_time = time.time()
+
+    def check_connection(self):
+        """Check connection health"""
+        current_time = time.time()
+
+        # Send heartbeat periodically
+        if self.connected and current_time - self.last_heartbeat_time > self.heartbeat_interval:
+            self.send_heartbeat()
+
+        # Check for timeout
+        if not self.connected and current_time - self.connection_start > self.connection_timeout:
+            self.log("Connection timeout")
+            self.running = False
+
+        # Check for server timeout
+        if self.connected and current_time - self.last_snapshot_time > 5.0:
+            self.log("Server seems unresponsive")
+            # Try reconnecting
+            if current_time - self.last_snapshot_time > 10.0:
+                self.log("Server timeout - disconnecting")
+                self.running = False
+
+    def receive_thread(self):
+        """Thread for receiving packets"""
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(4096)
+                if addr == self.server_addr:
+                    self.handle_packet(data, addr)
+                    self.last_recv_time = time.time()
+            except socket.timeout:
+                pass
             except Exception as e:
-                self.log(f"Receive error: {e}")
+                if self.running:  # Only log if still running
+                    self.log(f"Receive error: {e}")
 
     def auto_input_thread(self):
-        """Auto bot thread with logging"""
+        """Auto bot thread"""
         while self.running and self.connected:
-            time.sleep(random.uniform(0.1, 0.5))
+            time.sleep(random.uniform(0.2, 0.8))  # Slower auto inputs
+
             self.seq_num += 1
 
-            if random.random() < 0.8:  # 80% chance to move
-                # Send move
+            if random.random() < 0.7:  # 70% move, 30% claim
                 direction = random.choice([0, 1, 2, 3])
-                dir_names = {0: 'UP', 1: 'DOWN', 2: 'LEFT', 3: 'RIGHT'}
-                direction_name = dir_names.get(direction, 'UNKNOWN')
-
-                game_state = self.game.get_state()
-                if self.player_id in game_state['players']:
-                    row, col = game_state['players'][self.player_id]
-                    self.log(f"Auto MOVE: from ({row},{col}) direction={direction_name}")
-
-                self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num, struct.pack('B', direction))
-            else:  # 20% chance to claim
-                # Send claim
-                game_state = self.game.get_state()
-                if self.player_id in game_state['players']:
-                    row, col = game_state['players'][self.player_id]
-                    cell_status = self.game.get_player_cell_status(self.player_id)
-                    if cell_status['is_claimed']:
-                        if cell_status['is_own_cell']:
-                            self.log(f"Auto CLAIM: at ({row},{col}) - already my cell")
-                        else:
-                            self.log(f"Auto CLAIM: at ({row},{col}) - owned by Player {cell_status['owner']}")
-                    else:
-                        self.log(f"Auto CLAIM: at ({row},{col}) - unclaimed cell")
-
-                self.send_message(MSG_TYPES['CLAIM'], 0, self.seq_num)
+                self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num,
+                                  struct.pack('B', direction), reliable=True)
+            else:
+                self.send_message(MSG_TYPES['CLAIM'], 0, self.seq_num, b'', reliable=True)
                 self.pending_claim = True
                 self.claim_timer = self.claim_timeout
 
+    def get_fps(self):
+        """Calculate current FPS"""
+        if not self.frame_times:
+            return 0.0
+        return len(self.frame_times) / sum(self.frame_times)
+
+    def render_debug_info(self, screen, font):
+        """Render debug information"""
+        debug_lines = [
+            f"Player: {self.player_id or 'Connecting...'}",
+            f"FPS: {self.get_fps():.1f}",
+            f"Latency: {self.avg_latency:.0f}ms",
+            f"Packet Loss: {self.packet_loss * 100:.1f}%",
+            f"Snapshot: {self.snapshot_id}",
+            f"Events: {len([e for e in self.events.values() if not e['collected']])}",
+        ]
+
+        y_offset = 5
+        for line in debug_lines:
+            text = font.render(line, True, (200, 200, 255))
+            screen.blit(text, (5, y_offset))
+            y_offset += 20
+
     def run(self):
+        """Main client loop"""
+        self.log(f"Starting client '{self.client_name}'")
+        self.log(f"Connecting to {self.server_addr[0]}:{self.server_addr[1]}")
+
         # Connect to server
-        self.log(f"Starting connection to server at {self.server_addr[0]}:{self.server_addr[1]}")
-        self.send_message(MSG_TYPES['CONNECT'], 0, 0)
+        self.connection_start = time.time()
+        self.send_message(MSG_TYPES['CONNECT'], 0, 0, b'', reliable=True)
 
         # Start threads
         threading.Thread(target=self.receive_thread, daemon=True).start()
@@ -356,170 +470,143 @@ class Client:
         screen = pygame.display.set_mode((grid_size * CELL_SIZE, grid_size * CELL_SIZE))
         pygame.display.set_caption(f"Grid Clash - {self.client_name}")
         clock = pygame.time.Clock()
-        smoothing_speed = 5.0
-        font = pygame.font.Font(None, 24)  # For text rendering
-        small_font = pygame.font.Font(None, 18)  # Smaller font for stats
-        title_font = pygame.font.Font(None, 32)  # Larger font for titles
 
-        # Connection timeout
-        connection_start = time.time()
-        connection_timeout = 10.0  # 10 seconds timeout
+        # Fonts
+        font = pygame.font.Font(None, 24)
+        small_font = pygame.font.Font(None, 18)
+        title_font = pygame.font.Font(None, 32)
+        debug_font = pygame.font.Font(None, 16)
+
+        # Smoothing
+        smoothing_speed = 8.0
 
         # Main loop
         while self.running:
-            dt = clock.tick(60) / 1000.0
-            self.event_pulse_time += dt
+            frame_start = time.time()
 
-            # Check connection timeout
-            if not self.connected and time.time() - connection_start > connection_timeout:
-                self.log("Connection timeout - server not responding")
-                self.running = False
-                break
+            # Check connection
+            self.check_connection()
 
-            # Clean up expired player events
+            # Handle claim timeout
+            if self.pending_claim:
+                self.claim_timer -= clock.get_time() / 1000.0
+                if self.claim_timer <= 0:
+                    self.pending_claim = False
+                    self.log("Claim timeout")
+
+            # Handle events
             current_time = time.time()
-            expired_events = []
-            for pid, event_data in list(self.player_events.items()):
-                if current_time > event_data['expiration_time']:
-                    expired_events.append(pid)
 
-            for pid in expired_events:
+            # Clean expired player events
+            expired_players = []
+            for pid, event_data in list(self.player_events.items()):
+                if current_time > event_data.get('expiration_time', 0):
+                    expired_players.append(pid)
+
+            for pid in expired_players:
                 if pid in self.player_events:
                     del self.player_events[pid]
-                    if pid == self.player_id:
-                        self.log("Star effect expired")
 
-            # Clean up collected events (after a delay)
+            # Clean collected events after delay
             events_to_remove = []
             for event_id, event_data in list(self.events.items()):
-                if event_data['collected'] and current_time - event_data.get('collected_time', current_time) > 1.0:
+                if (event_data.get('collected') and
+                        current_time - event_data.get('collected_time', 0) > 1.0):
                     events_to_remove.append(event_id)
 
             for event_id in events_to_remove:
                 del self.events[event_id]
 
-            # Handle input
+            # Process pygame events
             for event in pygame.event.get():
-                if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+                if event.type == pygame.QUIT:
                     self.running = False
-                    self.log("User requested quit")
+                    self.log("User quit")
                 elif event.type == pygame.KEYDOWN and self.player_id:
-                    game_state = self.game.get_state()
-                    if self.player_id in game_state['players']:
-                        row, col = game_state['players'][self.player_id]
-
-                    if event.key == pygame.K_UP:
-                        self.seq_num += 1
-                        self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num, struct.pack('B', 0))
-                        if self.player_id in game_state['players']:
-                            self.log(f"User MOVE UP: from ({row},{col})")
-                    elif event.key == pygame.K_DOWN:
-                        self.seq_num += 1
-                        self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num, struct.pack('B', 1))
-                        if self.player_id in game_state['players']:
-                            self.log(f"User MOVE DOWN: from ({row},{col})")
-                    elif event.key == pygame.K_LEFT:
-                        self.seq_num += 1
-                        self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num, struct.pack('B', 2))
-                        if self.player_id in game_state['players']:
-                            self.log(f"User MOVE LEFT: from ({row},{col})")
-                    elif event.key == pygame.K_RIGHT:
-                        self.seq_num += 1
-                        self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num, struct.pack('B', 3))
-                        if self.player_id in game_state['players']:
-                            self.log(f"User MOVE RIGHT: from ({row},{col})")
-                    elif event.key == pygame.K_SPACE and not self.pending_claim:
-                        self.seq_num += 1
-                        cell_status = self.game.get_player_cell_status(self.player_id)
-                        if cell_status['is_claimed']:
-                            if cell_status['is_own_cell']:
-                                self.log(f"User CLAIM: at ({row},{col}) - already my cell")
-                            else:
-                                self.log(f"User CLAIM: at ({row},{col}) - owned by Player {cell_status['owner']}")
-                        else:
-                            self.log(f"User CLAIM: at ({row},{col}) - unclaimed cell")
-
-                        self.send_message(MSG_TYPES['CLAIM'], 0, self.seq_num)
-                        self.pending_claim = True
-                        self.claim_timer = self.claim_timeout
-
-            # Handle claim timeout
-            if self.pending_claim:
-                self.claim_timer -= dt
-                if self.claim_timer <= 0:
-                    self.seq_num += 1
-                    self.log("Claim timeout - retrying...")
-                    self.send_message(MSG_TYPES['CLAIM'], 0, self.seq_num)
-                    self.claim_timer = self.claim_timeout
+                    if event.key == pygame.K_ESCAPE:
+                        self.running = False
+                        self.log("User quit (ESC)")
+                    elif not self.pending_claim:
+                        if event.key == pygame.K_UP:
+                            self.seq_num += 1
+                            self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num,
+                                              struct.pack('B', 0), reliable=True)
+                            self.predict_move(0)
+                        elif event.key == pygame.K_DOWN:
+                            self.seq_num += 1
+                            self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num,
+                                              struct.pack('B', 1), reliable=True)
+                            self.predict_move(1)
+                        elif event.key == pygame.K_LEFT:
+                            self.seq_num += 1
+                            self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num,
+                                              struct.pack('B', 2), reliable=True)
+                            self.predict_move(2)
+                        elif event.key == pygame.K_RIGHT:
+                            self.seq_num += 1
+                            self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num,
+                                              struct.pack('B', 3), reliable=True)
+                            self.predict_move(3)
+                        elif event.key == pygame.K_SPACE:
+                            self.seq_num += 1
+                            self.send_message(MSG_TYPES['CLAIM'], 0, self.seq_num,
+                                              b'', reliable=True)
+                            self.pending_claim = True
+                            self.claim_timer = self.claim_timeout
 
             # Smooth positions
             game_state = self.game.get_state()
             for pid, target_pos in game_state['players'].items():
                 if pid in self.display_positions:
                     current_pos = self.display_positions[pid]
-                    speed = smoothing_speed
-
                     new_pos = GridClashGame.interpolate_position(
-                        current_pos, target_pos, speed, dt)
+                        current_pos, target_pos, smoothing_speed, clock.get_time() / 1000.0)
                     self.display_positions[pid] = new_pos
                 else:
                     self.display_positions[pid] = (float(target_pos[0]), float(target_pos[1]))
 
-            # Log positions
-            if self.position_log and self.player_id in self.display_positions:
-                curr_time = time.time()
-                row, col = self.display_positions[self.player_id]
-                self.position_log.write(f"{curr_time},{self.player_id},{row},{col}\n")
-                self.position_log.flush()
-
             # Render
-            screen.fill((0, 0, 0))
-            game_state = self.game.get_state()
-            grid = game_state['grid']
-            grid_size = self.game.grid_size
+            render_start = time.time()
+            screen.fill((20, 20, 30))  # Dark blue background
 
             # Draw grid cells
             for i in range(grid_size):
                 for j in range(grid_size):
-                    cell_value = grid[i][j]
+                    cell_value = game_state['grid'][i][j]
                     color = GridClashGame.get_color(cell_value)
                     pygame.draw.rect(screen, color,
                                      (j * CELL_SIZE, i * CELL_SIZE, CELL_SIZE, CELL_SIZE))
 
-            # Draw grid lines for better visibility
+            # Draw grid lines
             for i in range(grid_size + 1):
-                # Horizontal lines
-                pygame.draw.line(screen, (50, 50, 50),
+                pygame.draw.line(screen, (40, 40, 50),
                                  (0, i * CELL_SIZE),
                                  (grid_size * CELL_SIZE, i * CELL_SIZE), 1)
-                # Vertical lines
-                pygame.draw.line(screen, (50, 50, 50),
+                pygame.draw.line(screen, (40, 40, 50),
                                  (i * CELL_SIZE, 0),
                                  (i * CELL_SIZE, grid_size * CELL_SIZE), 1)
 
-            # Draw special events on grid (only STAR events now)
-            pulse = (math.sin(self.event_pulse_time * 5) + 1) * 0.5  # 0 to 1 pulsation
+            # Draw events
+            pulse = (math.sin(self.event_pulse_time * 5) + 1) * 0.5
             for event_id, event_data in self.events.items():
                 if not event_data['collected']:
                     row, col = event_data['row'], event_data['col']
 
-                    # Star event color (gold with pulse)
-                    base_color = (255, 215, 0)  # Gold
-                    pulse_color = (255, 255, 200)  # Light gold for pulse
+                    # Star drawing
+                    center_x = col * CELL_SIZE + CELL_SIZE / 2
+                    center_y = row * CELL_SIZE + CELL_SIZE / 2
+                    radius = int(CELL_SIZE / 4)
 
-                    # Blend colors for pulse effect
+                    # Pulsing color
+                    base_color = (255, 215, 0)
+                    pulse_color = (255, 255, 200)
                     color = (
                         int(base_color[0] * (1 - pulse) + pulse_color[0] * pulse),
                         int(base_color[1] * (1 - pulse) + pulse_color[1] * pulse),
                         int(base_color[2] * (1 - pulse) + pulse_color[2] * pulse)
                     )
 
-                    # Draw event as a star in the cell
-                    center_x = col * CELL_SIZE + CELL_SIZE / 2
-                    center_y = row * CELL_SIZE + CELL_SIZE / 2
-
-                    # Draw a star shape
-                    radius = int(CELL_SIZE / 4)
+                    # Draw star
                     points = []
                     for i in range(5):
                         angle = math.pi / 2 + i * 4 * math.pi / 5
@@ -530,164 +617,122 @@ class Client:
                         points.extend([(outer_x, outer_y), (inner_x, inner_y)])
                     pygame.draw.polygon(screen, color, points)
 
-            # Draw players with outlines when on claimed cells
+            # Draw players
             for pid, (row, col) in self.display_positions.items():
-                # Get player color
                 color = GridClashGame.get_color(pid)
                 center_x = col * CELL_SIZE + CELL_SIZE / 2
                 center_y = row * CELL_SIZE + CELL_SIZE / 2
                 radius = int(CELL_SIZE / 3)
 
-                # Check if player should have outline
-                should_draw_outline = False
-                if 0 <= int(row) < grid_size and 0 <= int(col) < grid_size:
-                    # Check the actual grid cell player is standing on
-                    cell_row, cell_col = int(row), int(col)
-                    should_draw_outline = GridClashGame.should_draw_outline(
-                        cell_row, cell_col, grid, pid
-                    )
-
-                # Draw player circle
+                # Draw player
                 pygame.draw.circle(screen, color, (int(center_x), int(center_y)), radius)
 
-                # Draw outline if player is on claimed cell
-                if should_draw_outline:
+                # Draw outline if on claimed cell
+                cell_row, cell_col = int(row), int(col)
+                if GridClashGame.should_draw_outline(cell_row, cell_col, game_state['grid'], pid):
                     outline_color = GridClashGame.get_outline_color(pid)
-                    # Draw thicker outline around player
                     pygame.draw.circle(screen, outline_color,
-                                       (int(center_x), int(center_y)),
-                                       radius + 3, 3)  # 3 pixel thick outline
+                                       (int(center_x), int(center_y)), radius + 3, 3)
 
-                # Draw event indicator on player if they have an active star event
+                # Draw event indicator
                 if pid in self.player_events:
-                    event_type = self.player_events[pid]['type']
-                    if event_type == 1:  # Star
-                        # Draw small star above player
-                        star_radius = int(CELL_SIZE / 8)
-                        star_y = center_y - radius - star_radius - 2
-                        pygame.draw.circle(screen, (255, 215, 0),
-                                           (int(center_x), int(star_y)),
-                                           star_radius)
+                    star_y = center_y - radius - int(CELL_SIZE / 8) - 2
+                    pygame.draw.circle(screen, (255, 215, 0),
+                                       (int(center_x), int(star_y)), int(CELL_SIZE / 8))
 
-            # Draw player info and status
+            # Draw UI
             if self.player_id:
-                # Show which player you are
+                # Player info
                 player_color = GridClashGame.get_color(self.player_id)
                 player_text = font.render(f"You: Player {self.player_id}", True, player_color)
-                screen.blit(player_text, (5, 5))
+                screen.blit(player_text, (5, grid_size * CELL_SIZE - 150))
 
-                # Show current score and win condition
-                scores = game_state['scores']
-                your_score = scores.get(self.player_id, 0)
+                # Score
+                your_score = game_state['scores'].get(self.player_id, 0)
                 score_text = font.render(f"Score: {your_score}/200", True, (255, 255, 255))
-                screen.blit(score_text, (5, 30))
+                screen.blit(score_text, (5, grid_size * CELL_SIZE - 125))
 
-                # Show progress towards win
+                # Progress bar
                 progress = min(your_score / 200, 1.0)
-                progress_width = int(progress * 100)
-                pygame.draw.rect(screen, (100, 100, 100), (5, 55, 100, 10))
-                pygame.draw.rect(screen, (0, 255, 0), (5, 55, progress_width, 10))
+                pygame.draw.rect(screen, (60, 60, 70), (5, grid_size * CELL_SIZE - 100, 150, 12))
+                pygame.draw.rect(screen, (0, 200, 0), (5, grid_size * CELL_SIZE - 100, int(150 * progress), 12))
 
-                # Show cell status
+                # Cell status
                 cell_status = self.game.get_player_cell_status(self.player_id)
                 if cell_status['is_claimed']:
                     if cell_status['is_own_cell']:
-                        status_text = f"On YOUR claimed cell"
-                        status_color = (0, 255, 0)  # Green
+                        status_color = (0, 255, 0)
+                        status_text = "Your claimed cell"
                     else:
-                        status_text = f"On Player {cell_status['owner']}'s claimed cell"
-                        status_color = (255, 100, 100)  # Reddish
+                        status_color = (255, 100, 100)
+                        status_text = f"Player {cell_status['owner']}'s cell"
                 else:
-                    status_text = "On unclaimed cell - CLAIM IT!"
-                    status_color = (200, 200, 255)  # Light blue
+                    status_color = (200, 200, 255)
+                    status_text = "Unclaimed - Press SPACE!"
 
-                status_surface = font.render(status_text, True, status_color)
-                screen.blit(status_surface, (5, 70))
+                status_surface = small_font.render(status_text, True, status_color)
+                screen.blit(status_surface, (5, grid_size * CELL_SIZE - 80))
 
-                # Show active event status
+                # Active events
                 if self.player_id in self.player_events:
-                    event_data = self.player_events[self.player_id]
-                    event_type = event_data['type']
-                    remaining_time = max(0, event_data['expiration_time'] - current_time)
+                    remaining = max(0, self.player_events[self.player_id].get('expiration_time', 0) - current_time)
+                    event_text = font.render(f"★ STAR: {remaining:.1f}s", True, (255, 215, 0))
+                    screen.blit(event_text, (5, grid_size * CELL_SIZE - 55))
 
-                    event_name = "STAR POWER"
-                    event_color = (255, 215, 0)
-                    effect_desc = "Steal enemy blocks by moving over them"
+                # Controls reminder
+                controls = small_font.render("Controls: Arrows=Move, SPACE=Claim, ESC=Quit", True, (180, 180, 180))
+                screen.blit(controls, (5, grid_size * CELL_SIZE - 30))
 
-                    # Event status
-                    event_status = font.render(f"{event_name}: {remaining_time:.1f}s", True, event_color)
-                    screen.blit(event_status, (5, 95))
-
-                    # Effect description
-                    effect_text = small_font.render(effect_desc, True, (200, 200, 100))
-                    screen.blit(effect_text, (5, 120))
-
-                # Show game rules reminder
-                rules_y = grid_size * CELL_SIZE - 110
-                rules_text = small_font.render("NEW RULES:", True, (200, 200, 100))
-                screen.blit(rules_text, (5, rules_y))
-
-                rule1_y = grid_size * CELL_SIZE - 90
-                rule1_text = small_font.render("1. Can move through YOUR claimed cells", True, (200, 200, 100))
-                screen.blit(rule1_text, (5, rule1_y))
-
-                rule2_y = grid_size * CELL_SIZE - 70
-                rule2_text = small_font.render("2. First to 200 blocks WINS!", True, (200, 200, 100))
-                screen.blit(rule2_text, (5, rule2_y))
-
-                rule3_y = grid_size * CELL_SIZE - 50
-                rule3_text = small_font.render("3. ★ Star: Steal enemy cells (3s)", True, (255, 215, 0))
-                screen.blit(rule3_text, (5, rule3_y))
-
-                # Show controls reminder
-                controls_text = small_font.render("Controls: Arrow Keys = Move, SPACE = Claim, ESC = Quit", True,
-                                                  (200, 200, 200))
-                screen.blit(controls_text, (5, grid_size * CELL_SIZE - 25))
-
-                # Show connection status
+                # Connection status
                 if self.connected:
-                    conn_text = small_font.render(f"Connected as {self.client_name}", True, (0, 255, 0))
+                    conn_text = small_font.render(f"Connected ({self.avg_latency:.0f}ms)", True, (0, 255, 0))
                 else:
-                    conn_text = small_font.render("Connecting to server...", True, (255, 255, 0))
+                    conn_text = small_font.render("Connecting...", True, (255, 255, 0))
                 screen.blit(conn_text, (5, grid_size * CELL_SIZE - 10))
 
-            # Show game over message
+            # Draw debug info
+            self.render_debug_info(screen, debug_font)
+
+            # Game over overlay
             if game_state['game_over']:
                 overlay = pygame.Surface((grid_size * CELL_SIZE, grid_size * CELL_SIZE), pygame.SRCALPHA)
-                overlay.fill((0, 0, 0, 180))  # Semi-transparent black
+                overlay.fill((0, 0, 0, 200))
                 screen.blit(overlay, (0, 0))
 
                 winner = game_state['winner']
                 win_reason = game_state.get('win_reason', 'Game ended')
                 winner_color = GridClashGame.get_color(winner)
+
                 winner_text = title_font.render(f"GAME OVER! Winner: Player {winner}", True, winner_color)
-                winner_rect = winner_text.get_rect(center=(grid_size * CELL_SIZE // 2, grid_size * CELL_SIZE // 2 - 50))
+                winner_rect = winner_text.get_rect(center=(grid_size * CELL_SIZE // 2, grid_size * CELL_SIZE // 2 - 30))
                 screen.blit(winner_text, winner_rect)
 
-                reason_text = font.render(f"Reason: {win_reason}", True, (255, 255, 255))
-                reason_rect = reason_text.get_rect(center=(grid_size * CELL_SIZE // 2, grid_size * CELL_SIZE // 2 - 20))
+                reason_text = font.render(win_reason, True, (255, 255, 255))
+                reason_rect = reason_text.get_rect(center=(grid_size * CELL_SIZE // 2, grid_size * CELL_SIZE // 2))
                 screen.blit(reason_text, reason_rect)
 
-                scores_text = font.render(
-                    f"Scores: P1={game_state['scores'].get(1, 0)} | "
-                    f"P2={game_state['scores'].get(2, 0)} | "
-                    f"P3={game_state['scores'].get(3, 0)} | "
-                    f"P4={game_state['scores'].get(4, 0)}",
-                    True, (255, 255, 255)
-                )
-                scores_rect = scores_text.get_rect(center=(grid_size * CELL_SIZE // 2, grid_size * CELL_SIZE // 2 + 10))
-                screen.blit(scores_text, scores_rect)
-
             pygame.display.flip()
+
+            # Update timing
+            frame_time = time.time() - frame_start
+            self.frame_times.append(frame_time)
+            self.event_pulse_time += frame_time
+
+            # Cap at 60 FPS
+            clock.tick(60)
 
         # Cleanup
         pygame.quit()
         self.log("Client shutting down")
-        self.log_file.close()
+
+        if self.log_file:
+            self.log_file.close()
         if self.position_log:
             self.position_log.close()
         if self.metric_file:
             self.metric_file.close()
+
+        self.sock.close()
 
 
 if __name__ == '__main__':

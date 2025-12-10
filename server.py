@@ -4,455 +4,701 @@ import time
 import struct
 import threading
 import psutil
+import zlib
 from datetime import datetime
+from collections import deque, defaultdict
+from typing import Dict, Tuple, Optional, List, Set
+import traceback
+
+# Import from common and game modules
 from common import *
-from game import GridClashGame  # Import consolidated game logic
+from game import GridClashGame
+
+
+class ClientInfo:
+    """Information about a connected client"""
+
+    def __init__(self, addr, player_id):
+        self.addr = addr
+        self.player_id = player_id
+        self.connected_time = time.time()
+        self.last_heartbeat = time.time()
+        self.last_snapshot_seq = 0
+        self.last_snapshot_time = 0
+        self.avg_latency = 0
+        self.packet_loss = 0
+        self.quality_score = 100
+        self.needs_full_update = True
+        self.seq_manager = SequenceManager()
+        self.pending_acks = {}
+
+    def update_quality(self, latency, loss_rate):
+        """Update connection quality metrics"""
+        self.avg_latency = self.avg_latency * 0.7 + latency * 0.3
+        self.packet_loss = self.packet_loss * 0.7 + loss_rate * 0.3
+
+        # Calculate quality score (0-100)
+        latency_penalty = min(50, self.avg_latency * 0.5)
+        loss_penalty = min(50, self.packet_loss * 100)
+        self.quality_score = max(10, 100 - latency_penalty - loss_penalty)
+
+    def should_reduce_updates(self):
+        """Determine if this client needs reduced update rate"""
+        return self.quality_score < 50 or self.avg_latency > 200
 
 
 class Server:
     def __init__(self):
+        # Socket setup with large buffers
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
         self.sock.bind(('0.0.0.0', PORT))
+        self.sock.settimeout(0.1)  # Non-blocking with small timeout
 
         # Game instance
         self.game = GridClashGame()
 
-        # Network state
-        self.clients = {}  # addr -> player_id
-        self.player_addrs = {}  # player_id -> addr
-        self.next_player_id = 1
+        # Client management
+        self.clients: Dict[tuple, ClientInfo] = {}  # addr -> ClientInfo
+        self.player_to_addr: Dict[int, tuple] = {}  # player_id -> addr
+
+        # Server state
         self.snapshot_id = 0
         self.seq_num = 0
         self.running = True
         self.lock = threading.Lock()
-        self.last_snapshot_payload = None
-        self.start_time = time.time()
-        self.total_packets_sent = 0
-        self.total_packets_received = 0
+        self.snapshot_history = deque(maxlen=20)  # Keep last 20 snapshots
 
-        # Event timing
+        # Timing
+        self.start_time = time.time()
+        self.last_metrics_time = time.time()
+        self.last_cleanup_time = time.time()
         self.last_event_spawn_time = time.time()
-        self.event_spawn_interval = 3.0  # Every 3 seconds
-        self.last_event_check_time = time.time()
+
+        # Statistics
+        self.stats = {
+            'packets_sent': 0,
+            'packets_received': 0,
+            'bytes_sent': 0,
+            'bytes_received': 0,
+            'compression_savings': 0,
+        }
+
+        # Adaptive broadcast
+        self.broadcast_intervals = {}  # addr -> interval
+        self.min_interval = UPDATE_INTERVAL
+        self.max_interval = UPDATE_INTERVAL * 3
 
         # Logging
         self.log_file = open('server_log.txt', 'w')
         self.position_log = open('server_position_log.csv', 'w')
-        self.position_log.write('time,snapshot_id,player_id,row,col\n')
+        self.position_log.write('timestamp,snapshot_id,player_id,row,col\n')
         self.metrics_log = open('server_metrics.csv', 'w')
-        self.metrics_log.write('timestamp,cpu_percent,clients_connected,packets_sent,packets_received,bandwidth_kbps\n')
+        self.metrics_log.write('timestamp,clients_connected,cpu_percent,memory_mb,bandwidth_kbps,avg_latency\n')
 
-        self.packets_sent = 0
-        self.bytes_sent = 0
-        self.metrics_update_interval = 2.0
-        self.last_metrics_time = time.time()
+        print(f"Server initialized on port {PORT}")
 
     def _get_timestamp(self):
-        """Get current timestamp in the format: YYYY-MM-DD HH:MM:SS,SSS"""
+        """Get current timestamp"""
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
 
     def log(self, msg, prefix="[SERVER]"):
         """Enhanced logging with timestamp"""
         timestamp = self._get_timestamp()
         full_msg = f"{timestamp} - {prefix} {msg}"
-        print(full_msg)  # Also print to console
+        print(full_msg)
         self.log_file.write(full_msg + "\n")
         self.log_file.flush()
 
-    def send_message(self, addr, msg_type, snapshot_id, seq_num, payload=b''):
-        timestamp = int(time.time() * 1000)
-        payload_len = len(payload)
-        checksum = compute_checksum(payload)
-        header = struct.pack(HEADER_FMT, PROTO_ID, VERSION, msg_type,
-                             snapshot_id, seq_num, timestamp, payload_len, checksum)
-        data = header + payload
-        self.sock.sendto(data, addr)
-        self.packets_sent += 1
-        self.total_packets_sent += 1
-        self.bytes_sent += len(data)
+    def send_message(self, addr, msg_type, snapshot_id, seq_num, payload=b'', reliable=False):
+        """Send message with optional reliability"""
+        try:
+            if reliable:
+                # Store for potential retransmission
+                client_info = self.clients.get(addr)
+                if client_info:
+                    client_info.pending_acks[seq_num] = (payload, time.time())
+                    client_info.seq_manager.packet_sent(seq_num)
 
-        # Enhanced logging for sent messages
-        player_id = self.clients.get(addr, 0)
-        if msg_type == MSG_TYPES['WELCOME']:
-            if len(payload) >= 2:
-                assigned_id, grid_size = struct.unpack('BB', payload[:2])
-                self.log(f"Sent WELCOME to Player{assigned_id} at {addr[0]}:{addr[1]} seq={seq_num}")
-        elif msg_type == MSG_TYPES['SNAPSHOT']:
-            # Don't log every snapshot to avoid spam, log every 10th
-            if snapshot_id % 10 == 0:
-                game_state = self.game.get_state()
-                player_count = len(game_state['players'])
-                self.log(f"Broadcast SNAPSHOT seq={seq_num} to {player_count} players")
-        elif msg_type == MSG_TYPES['ACK']:
-            if len(payload) >= 2:
-                row, col = struct.unpack('BB', payload[:2])
-                self.log(f"Sent ACK to Player{player_id} seq={seq_num}: claim_success at ({row},{col})")
-        elif msg_type == MSG_TYPES['NACK']:
-            if len(payload) >= 2:
-                row, col = struct.unpack('BB', payload[:2])
-                self.log(f"Sent NACK to Player{player_id} seq={seq_num}: claim_failed at ({row},{col})")
-        elif msg_type == MSG_TYPES['GAME_OVER']:
-            if len(payload) >= 6:  # Updated for win_reason
-                winner = payload[0]
-                win_reason_len = payload[1]
-                if win_reason_len > 0:
-                    win_reason = payload[2:2 + win_reason_len].decode('utf-8', errors='ignore')
-                else:
-                    win_reason = "Game ended"
-                self.log(f"Broadcast GAME_OVER seq={seq_num}: winner=Player{winner}, reason={win_reason}")
-        elif msg_type == MSG_TYPES['EVENT_SPAWN']:
-            if len(payload) >= 4:
-                event_id, event_type, row, col = struct.unpack('BBBB', payload[:4])
-                event_name = "Star"
-                self.log(f"Sent EVENT_SPAWN: {event_name} at ({row},{col}) to {addr[0]}:{addr[1]}")
-        elif msg_type == MSG_TYPES['EVENT_COLLECT']:
-            if len(payload) >= 4:
-                event_id, event_type, player_id, _ = struct.unpack('BBBB', payload[:4])
-                event_name = "Star"
-                self.log(f"Sent EVENT_COLLECT: Player{player_id} collected {event_name}")
+            # Check if we should compress
+            is_compressed = False
+            if len(payload) > 100 and msg_type not in [MSG_TYPES['HEARTBEAT'], MSG_TYPES['CONNECT'],
+                                                       MSG_TYPES['WELCOME']]:
+                compressed = zlib.compress(payload, level=1)
+                if len(compressed) < len(payload):
+                    payload = compressed
+                    is_compressed = True
 
-    def broadcast_thread(self):
-        """Broadcast game state with redundancy and handle events"""
-        last_log_time = time.time()
+            if is_compressed:
+                msg_type = MSG_TYPES['COMPRESSED']
 
-        while self.running:
-            time.sleep(UPDATE_INTERVAL)
-            with self.lock:
-                current_time = time.time()
+            timestamp = int(time.time() * 1000)
+            payload_len = len(payload)
+            checksum = compute_checksum(payload)
+            header = create_header(msg_type, snapshot_id, seq_num, payload_len, checksum)
+            data = header + payload
 
-                # Update events
-                self.game.update_events()
+            bytes_sent = self.sock.sendto(data, addr)
 
-                # Check for event collisions
-                if current_time - self.last_event_check_time > 0.1:  # Check every 100ms
-                    self.check_event_collisions()
-                    self.last_event_check_time = current_time
+            # Update stats
+            self.stats['packets_sent'] += 1
+            self.stats['bytes_sent'] += len(data)
 
-                self.snapshot_id += 1
+            # Log significant events
+            if msg_type == MSG_TYPES['WELCOME'] and len(payload) >= 2:
+                assigned_id, _ = struct.unpack('BB', payload[:2])
+                self.log(f"Welcome sent to Player{assigned_id} at {addr[0]}:{addr[1]}")
+
+        except Exception as e:
+            self.log(f"Send error to {addr}: {e}")
+
+    def broadcast_to_all(self, msg_type, payload=b'', reliable=False, exclude_addr=None):
+        """Broadcast message to all connected clients"""
+        with self.lock:
+            for addr, client_info in list(self.clients.items()):
+                if addr == exclude_addr:
+                    continue
+                self.send_message(addr, msg_type, 0, self.seq_num, payload, reliable)
                 self.seq_num += 1
 
-                # Get snapshot from game (now includes events)
-                current_payload = self.game.get_snapshot_payload()
+    def broadcast_snapshot(self):
+        """Broadcast game state to all clients with adaptive rate"""
+        with self.lock:
+            current_time = time.time()
+            self.snapshot_id += 1
 
-                # Add redundancy
-                if self.last_snapshot_payload:
-                    redundant_payload = self.last_snapshot_payload + current_payload
+            # Update game events
+            self.game.update_events()
+
+            # Get compressed snapshot
+            is_compressed, snapshot_data = self.game.get_compressed_snapshot(0)
+
+            # Store in history for resend requests
+            self.snapshot_history.append({
+                'seq': self.snapshot_id,
+                'data': snapshot_data,
+                'time': current_time,
+                'compressed': is_compressed
+            })
+
+            # Check for event spawn
+            if current_time - self.last_event_spawn_time >= EVENT_SPAWN_INTERVAL:
+                event = self.game.spawn_event()
+                if event:
+                    self.log(f"Spawned Star event at ({event.row},{event.col})")
+                    # Broadcast event spawn
+                    event_payload = struct.pack('BBBB', event.event_id, event.event_type,
+                                                event.row, event.col)
+                    self.broadcast_to_all(MSG_TYPES['EVENT_SPAWN'], event_payload)
+                self.last_event_spawn_time = current_time
+
+            # Send to each client with adaptive timing
+            clients_sent = 0
+            for addr, client_info in list(self.clients.items()):
+                # Check if it's time to send to this client
+                interval = self.broadcast_intervals.get(addr, UPDATE_INTERVAL)
+                if current_time - client_info.last_snapshot_time < interval:
+                    continue
+
+                # Adjust interval based on client quality
+                if client_info.should_reduce_updates():
+                    new_interval = min(self.max_interval, interval * 1.2)
                 else:
-                    redundant_payload = current_payload
-                self.last_snapshot_payload = current_payload
+                    new_interval = max(self.min_interval, interval * 0.9)
+                self.broadcast_intervals[addr] = new_interval
+
+                # Send snapshot
+                self.send_message(addr, MSG_TYPES['SNAPSHOT'],
+                                  self.snapshot_id, self.seq_num, snapshot_data, reliable=True)
+                self.seq_num += 1
+
+                client_info.last_snapshot_time = current_time
+                client_info.last_snapshot_seq = self.snapshot_id
+                clients_sent += 1
 
                 # Log positions
-                curr_time = time.time()
                 game_state = self.game.get_state()
-                for pid, (row, col) in game_state['players'].items():
-                    self.position_log.write(f"{curr_time},{self.snapshot_id},{pid},{row},{col}\n")
-                self.position_log.flush()
+                if client_info.player_id in game_state['players']:
+                    row, col = game_state['players'][client_info.player_id]
+                    self.position_log.write(
+                        f"{current_time:.3f},{self.snapshot_id},{client_info.player_id},{row},{col}\n")
 
-                # Broadcast to all clients
-                client_count = len(self.clients)
-                for addr in list(self.clients.keys()):
-                    self.send_message(addr, MSG_TYPES['SNAPSHOT'],
-                                      self.snapshot_id, self.seq_num, redundant_payload)
+            self.position_log.flush()
 
-                # Send event spawn messages if new events spawned
-                if current_time - self.last_event_spawn_time >= self.event_spawn_interval:
-                    self.broadcast_new_events()
-                    self.last_event_spawn_time = current_time
-
-                # Log snapshot broadcast periodically
-                if time.time() - last_log_time > 5.0:  # Every 5 seconds
-                    grid_filled = sum(cell != 0 for row in game_state['grid'] for cell in row)
-                    total_cells = self.game.grid_size * self.game.grid_size
-                    active_events = len(game_state['events'])
-                    active_player_events = len(game_state['player_events'])
-
-                    # Show scores and check for near-win
-                    scores_info = []
-                    for pid in range(1, 5):
-                        if pid in game_state['scores']:
-                            score = game_state['scores'][pid]
-                            scores_info.append(f"P{pid}={score}")
-                            if score >= 180:  # Alert when close to win
-                                self.log(f"ALERT: Player {pid} has {score} blocks! Close to winning!")
-
-                    self.log(
-                        f"Status: {client_count} players, scores: {', '.join(scores_info)}, "
-                        f"grid: {grid_filled}/{total_cells} filled, events: {active_events} active")
-                    last_log_time = time.time()
-
-                # Update metrics
-                self._update_metrics()
-
-    def check_event_collisions(self):
-        """Check if any player has collected an event"""
-        for player_id in list(self.clients.values()):
-            event = self.game.check_event_collision(player_id)
-            if event:
-                result = self.game.collect_event(player_id, event)
-
-                # Log event collection
-                event_name = "Star"
-                self.log(f"Player {player_id} collected {event_name} event at ({event.row},{event.col})")
-
-                # Send event collect message to all clients
-                payload = struct.pack('BBBB', event.event_id, event.event_type, player_id, 0)
-                for addr in list(self.clients.keys()):
-                    self.send_message(addr, MSG_TYPES['EVENT_COLLECT'], 0, 0, payload)
-
-    def broadcast_new_events(self):
-        """Broadcast newly spawned events to all clients"""
-        game_state = self.game.get_state()
-        spawned_count = 0
-
-        for event_id, event_data in game_state['events'].items():
-            if not event_data['collected']:
-                # Check if this is a newly spawned event (not already broadcast)
-                # We'll send all active events each time for simplicity
-
-                # Send event spawn message
-                payload = struct.pack('BBBB', event_id, event_data['type'],
-                                      event_data['row'], event_data['col'])
-
-                for addr in list(self.clients.keys()):
-                    self.send_message(addr, MSG_TYPES['EVENT_SPAWN'], 0, 0, payload)
-
-                spawned_count += 1
-
-        if spawned_count > 0:
-            self.log(f"Spawned {spawned_count} Star event(s)")
-
-    def _update_metrics(self):
-        current_time = time.time()
-        if current_time - self.last_metrics_time >= self.metrics_update_interval:
-            cpu_percent = psutil.cpu_percent(interval=None)
-            bandwidth_kbps = (self.bytes_sent * 8 / 1000) / (current_time - self.last_metrics_time)
-
-            self.metrics_log.write(
-                f"{current_time:.3f},{cpu_percent},{len(self.clients)},"
-                f"{self.total_packets_sent},{self.total_packets_received},{bandwidth_kbps:.2f}\n")
-            self.metrics_log.flush()
-
-            self.bytes_sent = 0
-            self.last_metrics_time = current_time
+            # Log if we sent any snapshots
+            if clients_sent > 0 and self.snapshot_id % 10 == 0:
+                game_state = self.game.get_state()
+                player_count = len(game_state['players'])
+                self.log(f"Sent snapshot {self.snapshot_id} to {clients_sent} players")
 
     def handle_connect(self, addr):
-        if addr not in self.clients and self.next_player_id <= 4:
-            player_id = self.next_player_id
-            self.next_player_id += 1
+        """Handle new client connection"""
+        with self.lock:
+            # Check if already connected
+            if addr in self.clients:
+                self.log(f"Duplicate connection from {addr}, refreshing")
+                client_info = self.clients[addr]
+                # Resend welcome
+                payload = struct.pack('BB', client_info.player_id, self.game.grid_size)
+                self.send_message(addr, MSG_TYPES['WELCOME'], 0, 0, payload, reliable=True)
+                return
 
-            # Add to network tables
-            self.clients[addr] = player_id
-            self.player_addrs[player_id] = addr
+            # Check server capacity
+            if len(self.clients) >= 4:
+                self.log(f"Server full, rejecting connection from {addr}")
+                return
+
+            # Assign player ID (1-4)
+            for player_id in range(1, 5):
+                if player_id not in self.player_to_addr:
+                    break
+            else:
+                player_id = len(self.clients) + 1
 
             # Add player to game
-            if self.game.add_player(player_id):
-                payload = struct.pack('BB', player_id, self.game.grid_size)
-                self.send_message(addr, MSG_TYPES['WELCOME'], 0, 0, payload)
-                self.log(f"Player {player_id} connected from {addr[0]}:{addr[1]}")
+            if not self.game.add_player(player_id):
+                self.log(f"Failed to add player {player_id} to game")
+                # Try to find empty spot in game
+                for pid in range(1, 5):
+                    if pid not in self.game.players:
+                        if self.game.add_player(pid):
+                            player_id = pid
+                            break
+                else:
+                    self.log(f"Game is full, cannot add player")
+                    return
 
-                # Log initial position
-                game_state = self.game.get_state()
-                if player_id in game_state['players']:
-                    row, col = game_state['players'][player_id]
-                    self.log(f"Player {player_id} placed at starting position ({row},{col})")
+            # Create client info
+            client_info = ClientInfo(addr, player_id)
+            self.clients[addr] = client_info
+            self.player_to_addr[player_id] = addr
 
-                    # Send current events to new player
-                    self.send_current_events_to_player(addr)
-            else:
-                self.log(f"Failed to add player {player_id} - game full or error")
+            # Send welcome message
+            payload = struct.pack('BB', player_id, self.game.grid_size)
+            self.send_message(addr, MSG_TYPES['WELCOME'], 0, 0, payload, reliable=True)
 
-    def send_current_events_to_player(self, addr):
-        """Send all current active events to a newly connected player"""
+            # Send current events
+            self.send_current_events(addr)
+
+            # Log connection
+            self.log(f"Player {player_id} connected from {addr[0]}:{addr[1]}")
+            self.log(f"Total clients: {len(self.clients)}/4")
+
+            # Force immediate snapshot
+            client_info.needs_full_update = True
+            client_info.last_snapshot_time = 0
+
+    def send_current_events(self, addr):
+        """Send all current events to client"""
         game_state = self.game.get_state()
-
         for event_id, event_data in game_state['events'].items():
             if not event_data['collected']:
                 payload = struct.pack('BBBB', event_id, event_data['type'],
                                       event_data['row'], event_data['col'])
                 self.send_message(addr, MSG_TYPES['EVENT_SPAWN'], 0, 0, payload)
 
-    def handle_move(self, player_id, payload):
-        if len(payload) == 1:
+    def handle_move(self, player_id, payload, timestamp):
+        """Handle player move with event checking"""
+        with self.lock:
+            if len(payload) != 1:
+                return
+
             direction = struct.unpack('B', payload)[0]
             dir_names = {0: 'UP', 1: 'DOWN', 2: 'LEFT', 3: 'RIGHT'}
             direction_name = dir_names.get(direction, 'UNKNOWN')
 
-            # Get current position before move
-            game_state = self.game.get_state()
-            old_row, old_col = game_state['players'].get(player_id, (-1, -1))
+            result = self.game.move_player(player_id, direction)
 
-            # Attempt move
-            success = self.game.move_player(player_id, direction)
+            if result['success']:
+                # Check for event collection
+                if result.get('event_collected'):
+                    event_data = result['event_collected']
 
-            # Get new position
-            game_state = self.game.get_state()
-            new_row, new_col = game_state['players'].get(player_id, (-1, -1))
+                    # Broadcast event collection
+                    collect_payload = struct.pack('BBBB',
+                                                  event_data['event_id'],
+                                                  event_data['event_type'],
+                                                  player_id, 0)
+                    self.broadcast_to_all(MSG_TYPES['EVENT_COLLECT'], collect_payload, reliable=True)
 
-            # Check for event collision after move
-            if success:
-                event = self.game.check_event_collision(player_id)
-                if event:
-                    result = self.game.collect_event(player_id, event)
+                    self.log(f"Player {player_id} collected Star at move {direction_name}")
 
-                    # Log event collection
-                    event_name = "Star"
-                    self.log(f"Player {player_id} collected {event_name} event while moving to ({new_row},{new_col})")
-
-                    # Send event collect message to all clients
-                    payload = struct.pack('BBBB', event.event_id, event.event_type, player_id, 0)
-                    for addr in list(self.clients.keys()):
-                        self.send_message(addr, MSG_TYPES['EVENT_COLLECT'], 0, 0, payload)
-
-            if success:
-                self.log(f"Player {player_id} moved {direction_name}: ({old_row},{old_col}) -> ({new_row},{new_col})")
             else:
-                # Player tried to move but was blocked
-                target_row, target_col = old_row, old_col
-                if direction == 0 and old_row > 0:  # UP
-                    target_row = old_row - 1
-                elif direction == 1 and old_row < self.game.grid_size - 1:  # DOWN
-                    target_row = old_row + 1
-                elif direction == 2 and old_col > 0:  # LEFT
-                    target_col = old_col - 1
-                elif direction == 3 and old_col < self.game.grid_size - 1:  # RIGHT
-                    target_col = old_col + 1
-
-                cell_owner = self.game.grid[target_row][
-                    target_col] if 0 <= target_row < self.game.grid_size and 0 <= target_col < self.game.grid_size else -1
-
-                if cell_owner == 0:
-                    self.log(f"Player {player_id} move {direction_name} blocked: at grid edge")
-                elif cell_owner == player_id:
-                    # This shouldn't happen with new rules, but just in case
-                    self.log(f"Player {player_id} move {direction_name} blocked: bug?")
-                else:
-                    self.log(
-                        f"Player {player_id} move {direction_name} blocked: target cell ({target_row},{target_col}) owned by Player {cell_owner}")
+                self.log(f"Player {player_id} move {direction_name} blocked")
 
     def handle_claim(self, player_id, addr):
-        # Get position before claim
-        game_state = self.game.get_state()
-        row, col = game_state['players'].get(player_id, (-1, -1))
-        cell_before = self.game.grid[row][
-            col] if 0 <= row < self.game.grid_size and 0 <= col < self.game.grid_size else -1
+        """Handle cell claim attempt"""
+        with self.lock:
+            result = self.game.claim_cell(player_id)
 
-        result = self.game.claim_cell(player_id)
+            if result['success']:
+                row, col = result['position']
+                self.send_message(addr, MSG_TYPES['ACK'], 0, 0,
+                                  struct.pack('BB', row, col), reliable=True)
 
-        if result['success']:
-            row, col = result['position']
-            self.send_message(addr, MSG_TYPES['ACK'], 0, 0, struct.pack('BB', row, col))
+                # Log claim
+                game_state = self.game.get_state()
+                score = game_state['scores'].get(player_id, 0)
+                self.log(f"Player {player_id} claimed ({row},{col}), score: {score}")
 
-            if cell_before == 0:
-                self.log(f"Player {player_id} claimed new cell at ({row},{col})")
-            elif cell_before == player_id:
-                self.log(f"Player {player_id} re-claimed own cell at ({row},{col})")
+                if result['game_over']:
+                    self.handle_game_over(result)
             else:
-                self.log(f"Player {player_id} claimed cell at ({row},{col}) previously owned by Player {cell_before}")
+                row, col = result['position']
+                self.send_message(addr, MSG_TYPES['NACK'], 0, 0,
+                                  struct.pack('BB', row, col))
+                self.log(f"Player {player_id} claim failed at ({row},{col})")
 
-            if result['game_over']:
-                winner = result['winner']
-                win_reason = result.get('win_reason', 'Game ended')
-                scores = result['scores']
+    def handle_game_over(self, result):
+        """Handle game over condition"""
+        winner = result['winner']
+        win_reason = result.get('win_reason', 'Game ended')
+        scores = result['scores']
 
-                # Send win reason along with winner
-                win_reason_bytes = win_reason.encode('utf-8')
-                payload = struct.pack('BB', winner, len(win_reason_bytes)) + win_reason_bytes
+        # Create game over payload
+        win_reason_bytes = win_reason.encode('utf-8')
+        payload = struct.pack('BB', winner, len(win_reason_bytes)) + win_reason_bytes
+        payload += struct.pack('BBBB', scores[1], scores[2], scores[3], scores[4])
 
-                # Add scores (4 bytes)
-                payload += struct.pack('BBBB', scores[1], scores[2], scores[3], scores[4])
+        # Broadcast to all clients
+        self.broadcast_to_all(MSG_TYPES['GAME_OVER'], payload, reliable=True)
 
-                for client_addr in list(self.clients.keys()):
-                    self.send_message(client_addr, MSG_TYPES['GAME_OVER'], 0, 0, payload)
+        self.log(f"GAME OVER! Winner: Player {winner} - {win_reason}")
+        self.log(f"Final scores: P1={scores[1]}, P2={scores[2]}, P3={scores[3]}, P4={scores[4]}")
 
-                self.running = False
-                self.log(f"GAME OVER! Winner: Player {winner} - {win_reason}")
-                self.log(f"Final scores: P1={scores[1]}, P2={scores[2]}, P3={scores[3]}, P4={scores[4]}")
-                print(f"\n{'=' * 60}")
-                print(f"GAME OVER! Winner: Player {winner}")
-                print(f"Reason: {win_reason}")
-                print(f"Final Scores: P1={scores[1]}, P2={scores[2]}, P3={scores[3]}, P4={scores[4]}")
-                print(f"{'=' * 60}\n")
-        else:
-            row, col = result['position']
-            cell_owner = self.game.grid[row][col]
-            self.send_message(addr, MSG_TYPES['NACK'], 0, 0, struct.pack('BB', row, col))
+        # Schedule server shutdown
+        self.log("Game over, server will shutdown in 10 seconds")
+        threading.Timer(10.0, self.initiate_shutdown).start()
 
-            if cell_owner == player_id:
-                self.log(f"Player {player_id} failed to claim cell at ({row},{col}): already their own cell")
+    def initiate_shutdown(self):
+        """Gracefully shutdown server"""
+        self.log("Initiating server shutdown...")
+        self.running = False
+
+    def check_timeouts(self):
+        """Check for client timeouts and cleanup"""
+        current_time = time.time()
+        timed_out = []
+
+        with self.lock:
+            for addr, client_info in list(self.clients.items()):
+                # Check heartbeat timeout (15 seconds)
+                if current_time - client_info.last_heartbeat > 15.0:
+                    timed_out.append((addr, client_info.player_id, "heartbeat timeout"))
+                # Check snapshot timeout (30 seconds)
+                elif current_time - client_info.last_snapshot_time > 30.0 and client_info.last_snapshot_time > 0:
+                    timed_out.append((addr, client_info.player_id, "stale connection"))
+
+            for addr, player_id, reason in timed_out:
+                self.disconnect_client(addr, player_id, reason)
+
+        # Periodic cleanup
+        if current_time - self.last_cleanup_time > 30.0:
+            self.cleanup_resources()
+            self.last_cleanup_time = current_time
+
+    def disconnect_client(self, addr, player_id, reason="disconnected"):
+        """Disconnect a client"""
+        with self.lock:
+            if addr in self.clients:
+                del self.clients[addr]
+
+            if player_id in self.player_to_addr:
+                del self.player_to_addr[player_id]
+
+            # Remove player from game
+            if player_id in self.game.players:
+                self.game.players.pop(player_id)
+
+            self.log(f"Player {player_id} {reason} from {addr[0]}:{addr[1]}")
+            self.log(f"Remaining clients: {len(self.clients)}/4")
+
+    def cleanup_resources(self):
+        """Clean up old resources"""
+        # Prune old snapshots from history
+        current_time = time.time()
+        while (self.snapshot_history and
+               current_time - self.snapshot_history[0]['time'] > 30.0):
+            self.snapshot_history.popleft()
+
+        # Clear old pending acks
+        for client_info in self.clients.values():
+            current_time = time.time()
+            expired_acks = []
+            for seq_num, (_, send_time) in client_info.pending_acks.items():
+                if current_time - send_time > 5.0:
+                    expired_acks.append(seq_num)
+
+            for seq_num in expired_acks:
+                del client_info.pending_acks[seq_num]
+
+    def update_metrics(self):
+        """Update and log server metrics"""
+        current_time = time.time()
+        if current_time - self.last_metrics_time < 2.0:
+            return
+
+        try:
+            cpu_percent = psutil.cpu_percent(interval=None)
+            memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
+
+            # Calculate bandwidth
+            time_diff = current_time - self.last_metrics_time
+            if time_diff > 0:
+                bandwidth_kbps = (self.stats['bytes_sent'] * 8 / 1000) / time_diff
             else:
-                self.log(f"Player {player_id} failed to claim cell at ({row},{col}): owned by Player {cell_owner}")
+                bandwidth_kbps = 0
 
-    def run(self):
-        self.log(f"Starting server on port {PORT}")
-        self.log(f"Game rules: Players can move through THEIR OWN claimed cells")
-        self.log(f"Game rules: Players cannot move through OTHER players' claimed cells")
-        self.log(f"Win condition: First player to claim 200 blocks OR all cells claimed")
-        self.log(f"Special events: 1 Star event spawns every 3 seconds in empty cells")
-        self.log(f"Star event: Steal enemy blocks by moving over them (3s duration)")
-        self.log(f"Update rate: {UPDATE_HZ}Hz, Grid size: {self.game.grid_size}x{self.game.grid_size}")
-        print(f"\n{'=' * 60}")
-        print(f"Grid Clash Server Running")
-        print(f"Port: {PORT}, Update Rate: {UPDATE_HZ}Hz")
-        print(f"Win Condition: First to 200 blocks OR all cells claimed")
-        print(f"Special Event: ★ Star (steal enemy cells)")
-        print(f"Star spawns every 3 seconds in empty cells")
-        print(f"Waiting for players to connect...")
-        print(f"{'=' * 60}\n")
+            # Calculate average latency
+            avg_latency = 0
+            if self.clients:
+                latencies = [c.avg_latency for c in self.clients.values()]
+                avg_latency = sum(latencies) / len(latencies)
 
-        broadcast_thread = threading.Thread(target=self.broadcast_thread, daemon=True)
-        broadcast_thread.start()
+            # Log metrics
+            self.metrics_log.write(
+                f"{current_time:.3f},{len(self.clients)},{cpu_percent:.1f},"
+                f"{memory_mb:.1f},{bandwidth_kbps:.1f},{avg_latency:.1f}\n")
+            self.metrics_log.flush()
+
+            # Reset counters
+            self.stats['bytes_sent'] = 0
+            self.last_metrics_time = current_time
+
+            # Log status periodically
+            if int(current_time) % 10 == 0:
+                game_state = self.game.get_state()
+                grid_filled = sum(cell != 0 for row in game_state['grid'] for cell in row)
+                total_cells = self.game.grid_size * self.game.grid_size
+                fill_percent = (grid_filled / total_cells) * 100 if total_cells > 0 else 0
+
+                self.log(f"Status: {len(self.clients)} players, "
+                         f"grid: {grid_filled}/{total_cells} ({fill_percent:.1f}%), "
+                         f"events: {len(game_state['events'])} active")
+
+        except Exception as e:
+            self.log(f"Metrics error: {e}")
+
+    def handle_packet(self, data, addr):
+        """Handle incoming packet"""
+        self.log(f"DEBUG: Processing packet from {addr}, size: {len(data)} bytes")
+
+        if len(data) < HEADER_SIZE:
+            self.log(f"DEBUG: Packet too small: {len(data)} bytes")
+            return
+
+        try:
+            # Debug: print first few bytes
+            self.log(f"DEBUG: First 10 bytes: {data[:10].hex() if len(data) >= 10 else 'too short'}")
+
+            header = parse_header(data[:HEADER_SIZE])
+            if not header:
+                self.log(f"DEBUG: Failed to parse header")
+                # Print what we got
+                if len(data) >= 4:
+                    self.log(f"DEBUG: First 4 bytes as string: {data[:4]}")
+                    self.log(f"DEBUG: Expected PROTO_ID: {PROTO_ID}")
+                return
+
+            protocol_id, version, msg_type, snapshot_id, seq_num, timestamp, payload_len, checksum = header
+
+            self.log(f"DEBUG: Packet parsed - type: {msg_type}, seq: {seq_num}")
+
+            # Validate protocol ID
+            if protocol_id != PROTO_ID:
+                self.log(f"DEBUG: Invalid protocol ID: got {protocol_id}, expected {PROTO_ID}")
+                return
+
+            if version != VERSION:
+                self.log(f"Client {addr} using wrong version: {version}")
+                return
+
+            # Get payload
+            payload = data[HEADER_SIZE:]
+            if len(payload) != payload_len:
+                self.log(f"Payload length mismatch from {addr}: expected {payload_len}, got {len(payload)}")
+                return
+
+            # Verify checksum
+            if compute_checksum(payload) != checksum:
+                self.log(f"Checksum mismatch from {addr}")
+                return
+
+            # Handle compressed payload
+            if msg_type == MSG_TYPES['COMPRESSED']:
+                try:
+                    payload = zlib.decompress(payload)
+                    msg_type = MSG_TYPES['SNAPSHOT']  # Assume snapshot after decompression
+                except:
+                    self.log(f"Decompression failed from {addr}")
+                    return
+
+            # Calculate latency
+            latency = int(time.time() * 1000) - timestamp
+
+            with self.lock:
+                client_info = self.clients.get(addr)
+
+                # Update heartbeat for any message from client
+                if client_info:
+                    client_info.last_heartbeat = time.time()
+                    client_info.update_quality(latency, 0)
+
+                # Handle message types
+                if msg_type == MSG_TYPES['CONNECT']:
+                    self.log(f"CONNECT received from {addr}")
+                    self.handle_connect(addr)
+
+                elif msg_type == MSG_TYPES['HEARTBEAT']:
+                    # Already updated heartbeat above
+                    self.log(f"DEBUG: Heartbeat from {addr}")
+                    pass
+
+                elif msg_type == MSG_TYPES['ACK_SNAPSHOT']:
+                    if client_info:
+                        client_info.seq_manager.ack_received(seq_num)
+
+                elif msg_type == MSG_TYPES['RESEND_REQUEST']:
+                    if client_info and len(payload) >= 4:
+                        missing_seq = struct.unpack('I', payload[:4])[0]
+                        self.handle_resend_request(addr, missing_seq)
+
+                elif client_info:
+                    # Handle game actions
+                    if msg_type == MSG_TYPES['MOVE']:
+                        self.handle_move(client_info.player_id, payload, timestamp)
+
+                    elif msg_type == MSG_TYPES['CLAIM']:
+                        self.handle_claim(client_info.player_id, addr)
+
+                else:
+                    # Unknown client sent message
+                    self.log(f"Unknown client {addr} sent message type {msg_type}")
+                    # Maybe send them a connect request?
+                    if msg_type != MSG_TYPES['CONNECT']:
+                        self.log(f"Telling unknown client to connect first")
+
+        except Exception as e:
+            self.log(f"Packet handling error from {addr}: {e}")
+            import traceback
+            self.log(f"Traceback: {traceback.format_exc()}")
+
+    def handle_resend_request(self, addr, missing_seq):
+        """Handle client request for missing data"""
+        client_info = self.clients.get(addr)
+        if not client_info:
+            return
+
+        # Find requested snapshot in history
+        for snapshot in self.snapshot_history:
+            if snapshot['seq'] == missing_seq:
+                msg_type = MSG_TYPES['COMPRESSED'] if snapshot['compressed'] else MSG_TYPES['SNAPSHOT']
+                self.send_message(addr, msg_type,
+                                  snapshot['seq'], 0, snapshot['data'], reliable=True)
+                self.log(f"Resent snapshot {missing_seq} to Player {client_info.player_id}")
+                break
+
+    def broadcast_thread(self):
+        """Main broadcast loop"""
+        last_snapshot_time = time.time()
 
         while self.running:
             try:
-                data, addr = self.sock.recvfrom(2048)
-                self.total_packets_received += 1
+                current_time = time.time()
 
-                if len(data) < HEADER_SIZE:
-                    continue
+                # Broadcast snapshot at appropriate interval
+                if current_time - last_snapshot_time >= self.min_interval:
+                    self.broadcast_snapshot()
+                    last_snapshot_time = current_time
 
-                header = data[:HEADER_SIZE]
-                protocol_id, version, msg_type, snapshot_id, seq_num, timestamp, payload_len, checksum = struct.unpack(
-                    HEADER_FMT, header)
+                # Check for timeouts
+                self.check_timeouts()
 
-                if protocol_id != PROTO_ID or version != VERSION or payload_len != len(data) - HEADER_SIZE:
-                    continue
+                # Update metrics
+                self.update_metrics()
 
-                payload = data[HEADER_SIZE:]
-                if compute_checksum(payload) != checksum:
-                    continue
-
-                with self.lock:
-                    if msg_type == MSG_TYPES['CONNECT']:
-                        self.log(f"Received CONNECT from {addr[0]}:{addr[1]} seq={seq_num}")
-                        self.handle_connect(addr)
-                    elif addr in self.clients:
-                        player_id = self.clients[addr]
-                        if msg_type == MSG_TYPES['MOVE']:
-                            self.handle_move(player_id, payload)
-                        elif msg_type == MSG_TYPES['CLAIM']:
-                            self.log(f"Received CLAIM from Player{player_id} seq={seq_num}")
-                            self.handle_claim(player_id, addr)
-                        elif msg_type == MSG_TYPES['ACK']:
-                            # Client ACK for our message
-                            pass
-                        elif msg_type == MSG_TYPES['EVENT_COLLECT']:
-                            # Client might send event collect (though server initiates)
-                            pass
+                # Small sleep to prevent CPU hogging
+                time.sleep(0.001)
 
             except Exception as e:
-                self.log(f"Error: {e}")
+                self.log(f"Broadcast thread error: {e}")
+
+    def run(self):
+        """Main server loop"""
+        self.log(f"Starting server on port {PORT}")
+        self.log(f"Update rate: {UPDATE_HZ}Hz (adaptive)")
+        self.log(f"Grid size: {self.game.grid_size}x{self.game.grid_size}")
+        self.log(f"Win condition: First to {MAX_SCORE_TO_WIN} blocks")
+        self.log(f"Compression: Enabled, Delta encoding: Enabled")
+
+        print(f"\n{'=' * 60}")
+        print(f"Grid Clash Server v2")
+        print(f"Port: {PORT}, Update Rate: {UPDATE_HZ}Hz (adaptive)")
+        print(f"Max Players: 4")
+        print(f"Win Condition: First to {MAX_SCORE_TO_WIN} blocks")
+        print(f"Special Event: ★ Star (steal enemy cells)")
+        print(f"Waiting for players to connect...")
+        print(f"{'=' * 60}\n")
+
+        # Start broadcast thread
+        broadcast_thread = threading.Thread(target=self.broadcast_thread, daemon=True)
+        broadcast_thread.start()
+
+        # Main receive loop - FIXED VERSION
+        self.log("Server ready, listening for connections...")
+
+        while self.running:
+            try:
+                # Set timeout to avoid blocking forever
+                self.sock.settimeout(0.1)
+
+                try:
+                    # Receive packet
+                    data, addr = self.sock.recvfrom(4096)
+
+                    # Log EVERY packet received
+                    self.log(f"RAW PACKET from {addr}: {len(data)} bytes")
+
+                    # Update received stats
+                    self.stats['packets_received'] += 1
+                    self.stats['bytes_received'] += len(data)
+
+                    # Process packet immediately (not in separate thread)
+                    self.handle_packet(data, addr)
+
+                except socket.timeout:
+                    # Expected for non-blocking socket
+                    continue
+
+            except Exception as e:
+                if self.running:  # Only log if still running
+                    self.log(f"Receive loop error: {e}")
+                    import traceback
+                    self.log(f"Traceback: {traceback.format_exc()}")
 
         self.cleanup()
 
     def cleanup(self):
+        """Cleanup resources on shutdown"""
         runtime = time.time() - self.start_time
-        self.log(f"Shutting down after {runtime:.1f} seconds")
-        self.log(f"Total packets sent: {self.total_packets_sent}, received: {self.total_packets_received}")
 
-        # Log final event statistics
+        # Log final statistics
+        self.log(f"Server runtime: {runtime:.1f} seconds")
+        self.log(f"Packets sent: {self.stats['packets_sent']}, "
+                 f"received: {self.stats['packets_received']}")
+
+        # Game statistics
         game_state = self.game.get_state()
-        event_stats = {'Star': {'total': 0, 'collected': 0}}
+        self.log(f"Final scores: "
+                 f"P1={game_state['scores'].get(1, 0)}, "
+                 f"P2={game_state['scores'].get(2, 0)}, "
+                 f"P3={game_state['scores'].get(3, 0)}, "
+                 f"P4={game_state['scores'].get(4, 0)}")
 
+        # Event statistics
+        event_stats = {'Star': {'total': 0, 'collected': 0}}
         for event_id, event_data in game_state.get('events', {}).items():
             event_stats['Star']['total'] += 1
             if event_data['collected']:
@@ -462,23 +708,25 @@ class Server:
             collection_rate = (stats['collected'] / stats['total'] * 100) if stats['total'] > 0 else 0
             self.log(f"{event_name} events: {stats['collected']}/{stats['total']} collected ({collection_rate:.1f}%)")
 
+        # Close files
         self.log_file.close()
         self.position_log.close()
         self.metrics_log.close()
-        self.sock.close()
+
+        try:
+            self.sock.close()
+        except:
+            pass
 
         print(f"\n{'=' * 60}")
         print(f"Server shutdown complete")
         print(f"Runtime: {runtime:.1f}s")
-        print(f"Total packets: {self.total_packets_sent} sent, {self.total_packets_received} received")
-
-        # Print event statistics
-        if event_stats:
-            print(f"Event Statistics:")
-            for event_name, stats in event_stats.items():
-                collection_rate = (stats['collected'] / stats['total'] * 100) if stats['total'] > 0 else 0
-                print(f"  {event_name}: {stats['collected']}/{stats['total']} collected ({collection_rate:.1f}%)")
-
+        print(f"Total packets: {self.stats['packets_sent']} sent, "
+              f"{self.stats['packets_received']} received")
+        print(f"Final scores: P1={game_state['scores'].get(1, 0)}, "
+              f"P2={game_state['scores'].get(2, 0)}, "
+              f"P3={game_state['scores'].get(3, 0)}, "
+              f"P4={game_state['scores'].get(4, 0)}")
         print(f"{'=' * 60}")
 
 
@@ -489,4 +737,10 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\n[SHUTDOWN] Server interrupted by user")
         server.running = False
+        server.cleanup()
+    except Exception as e:
+        print(f"\n[ERROR] Server crashed: {e}")
+        import traceback
+
+        traceback.print_exc()
         server.cleanup()
