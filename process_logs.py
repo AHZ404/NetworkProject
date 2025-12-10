@@ -8,15 +8,24 @@ from game import GridClashGame
 
 def analyze_position_errors():
     """Calculate position errors between server and client logs."""
-    server_df = pd.read_csv('server_position_log.csv')
+    try:
+        server_df = pd.read_csv('server_position_log.csv')
+    except FileNotFoundError:
+        print("Warning: Server position log ('server_position_log.csv') not found.")
+        return
 
     errors_all = []
 
     for player_id in server_df['player_id'].unique():
         try:
+            # Note: The client log format in the prompt was 'time,snapshot_id,row,col,latency'
+            # The updated format should be consistent with client.py's changes.
             client_df = pd.read_csv(f'client_{player_id}_position_log.csv')
         except FileNotFoundError:
-            print(f"Warning: No client log for player {player_id}")
+            print(f"Warning: No client position log for player {player_id}")
+            continue
+        except pd.errors.EmptyDataError:
+            print(f"Warning: Client position log for player {player_id} is empty.")
             continue
 
         # Filter data for this player
@@ -27,9 +36,9 @@ def analyze_position_errors():
             continue
 
         # Interpolate client positions at server timestamps
-        interp_row = interp1d(client_player['time'], client_player['row'],
+        interp_row = interp1d(client_player['time'], client_player['display_row'],
                               kind='linear', fill_value='extrapolate')
-        interp_col = interp1d(client_player['time'], client_player['col'],
+        interp_col = interp1d(client_player['time'], client_player['display_col'],
                               kind='linear', fill_value='extrapolate')
 
         # Calculate errors
@@ -49,17 +58,19 @@ def analyze_position_errors():
         p95_error = np.percentile(errors_all, 95)
 
         print(f"Position Error Analysis:")
-        print(f"  Mean: {mean_error:.4f}")
-        print(f"  Median: {median_error:.4f}")
-        print(f"  95th percentile: {p95_error:.4f}")
+        print(f"  Mean: {mean_error:.4f} cells")
+        print(f"  Median: {median_error:.4f} cells")
+        print(f"  95th percentile: {p95_error:.4f} cells")
         print(f"  Samples: {len(errors_all)}")
     else:
         print("No position error data available.")
 
 
 def analyze_latency():
-    """Analyze latency metrics from client logs."""
+    """Analyze latency and jitter metrics from client logs."""
     metrics_data = []
+    LATENCY_COL = 'latency_ms'  # Use the new, correct column name
+    JITTER_COL = 'jitter_ms'    # Use the new, correct column name
 
     for player_id in range(1, 5):
         try:
@@ -68,21 +79,39 @@ def analyze_latency():
             metrics_data.append(df)
         except FileNotFoundError:
             continue
+        except pd.errors.EmptyDataError:
+            continue
 
     if metrics_data:
         all_metrics = pd.concat(metrics_data, ignore_index=True)
 
-        print(f"\nLatency Analysis:")
-        print(f"  Mean latency: {all_metrics['latency'].mean():.2f} ms")
-        print(f"  Median latency: {all_metrics['latency'].median():.2f} ms")
-        print(f"  95th percentile: {all_metrics['latency'].quantile(0.95):.2f} ms")
-        print(f"  Mean jitter: {all_metrics['jitter'].mean():.4f} s")
+        # Filter out invalid values (e.g., initial 0s or placeholder 0s)
+        valid_latency = all_metrics[all_metrics[LATENCY_COL] > 0][LATENCY_COL].values
+        valid_jitter = all_metrics[all_metrics[JITTER_COL] > 0][JITTER_COL].values
+
+        if len(valid_latency) > 0:
+            print(f"\nLatency Analysis (Total Samples: {len(valid_latency)}):")
+            print(f"  Mean latency: {np.mean(valid_latency):.2f} ms")
+            print(f"  Median latency: {np.median(valid_latency):.2f} ms")
+            print(f"  95th percentile: {np.percentile(valid_latency, 95):.2f} ms")
+        else:
+            print("\nLatency data is invalid or empty.")
+
+        if len(valid_jitter) > 0:
+            print(f"\nJitter Analysis (Total Samples: {len(valid_jitter)}):")
+            print(f"  Mean jitter: {np.mean(valid_jitter):.2f} ms")
+            print(f"  Median jitter: {np.median(valid_jitter):.2f} ms")
+            print(f"  95th percentile: {np.percentile(valid_jitter, 95):.2f} ms")
+        else:
+            print("\nJitter data is invalid or empty.")
+
 
         # Plot latency over time
         plt.figure(figsize=(10, 6))
         for pid in all_metrics['player_id'].unique():
             player_data = all_metrics[all_metrics['player_id'] == pid]
-            plt.plot(player_data['snapshot_id'], player_data['latency'],
+            # Use snapshot_id for x-axis
+            plt.plot(player_data['snapshot_id'], player_data[LATENCY_COL],
                      label=f'Player {pid}', alpha=0.7)
 
         plt.xlabel('Snapshot ID')
@@ -95,7 +124,7 @@ def analyze_latency():
         print("Saved latency plot to 'latency_analysis.png'")
 
     else:
-        print("No latency metrics available.")
+        print("No metrics data available.")
 
 
 if __name__ == '__main__':

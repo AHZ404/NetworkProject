@@ -24,6 +24,7 @@ MSG_TYPES = {
     'ACK_SNAPSHOT': 11,  # New: Acknowledge snapshot
     'RESEND_REQUEST': 12,  # New: Request missing data
     'COMPRESSED': 13,  # New: Compressed payload flag
+    'FULL_SNAPSHOT': 14, # New: Full snapshot for late-joiner/resync
 }
 
 # Network settings
@@ -31,6 +32,7 @@ UPDATE_HZ = 30  # Increased from 20 to 30 for smoother updates
 UPDATE_INTERVAL = 1.0 / UPDATE_HZ
 HOST = '127.0.0.1'
 PORT = 1234
+MAX_PACKET_SIZE = 1200 # Max packet size in bytes (Constraint)
 
 # Visualization
 CELL_SIZE = 30
@@ -47,6 +49,9 @@ EVENT_STAR = 1
 EVENT_DURATION_STAR = 3.0
 EVENT_SPAWN_INTERVAL = 3.0
 MAX_EVENTS_ON_GRID = 5
+
+# Snapshot history on server (Our k)
+MAX_SNAPSHOT_HISTORY = 150 # Store ~5 seconds of history (150 snapshots @ 30Hz)
 
 # Sequence window size for reliable UDP
 SEQ_WINDOW_SIZE = 32
@@ -66,6 +71,7 @@ def create_header(msg_type, snapshot_id, seq_num, payload_len, checksum):
         msg_type = min(255, max(0, msg_type))
         snapshot_id = min(0xFFFFFFFF, max(0, snapshot_id))
         seq_num = min(0xFFFFFFFF, max(0, seq_num))
+        # Ensure payload length fits in the 16-bit field
         payload_len = min(0xFFFF, max(0, payload_len))
 
         header = struct.pack(HEADER_FMT, PROTO_ID, VERSION, msg_type,

@@ -1,21 +1,23 @@
-# server.py - FINAL FIXED VERSION
+# server.py - ROBUST UDP VERSION
 import socket
 import time
 import struct
 import threading
 import zlib
+import csv
 from datetime import datetime
-from collections import deque
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 
-# Import from common and game modules
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 from common import *
 from game import GridClashGame
 
 
 class ClientInfo:
-    """Lightweight client information"""
-
     def __init__(self, addr, player_id):
         self.addr = addr
         self.player_id = player_id
@@ -24,11 +26,12 @@ class ClientInfo:
         self.last_snapshot_time = 0
         self.avg_latency = 0
         self.sequence_counter = 0
+        self.last_acked_snapshot_id = 0  # Track last acknowledged snapshot
 
 
 class Server:
     def __init__(self):
-        # Socket setup
+        # UDP Socket Only
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
@@ -36,519 +39,358 @@ class Server:
         self.sock.bind(('0.0.0.0', PORT))
         self.sock.setblocking(False)
 
-        # Game instance
         self.game = GridClashGame()
 
-        # Client management (protected by lock)
+        # Client management
         self.clients: Dict[tuple, ClientInfo] = {}
         self.player_to_addr: Dict[int, tuple] = {}
         self.clients_lock = threading.Lock()
 
-        # Server state
+        # Snapshot history buffer: {snapshot_id: (is_compressed, data)}
+        self.snapshot_history: Dict[int, Tuple[bool, bytes]] = {}
         self.snapshot_id = 0
-        self.running = True
 
-        # Timing
+        self.running = True
         self.start_time = time.time()
         self.last_snapshot_time = time.time()
         self.last_event_spawn_time = time.time()
 
         # Statistics
         self.stats = {
-            'packets_sent': 0,
-            'packets_received': 0,
-            'bytes_sent': 0,
-            'bytes_received': 0,
+            'packets_sent': 0, 'packets_received': 0,
+            'bytes_sent': 0, 'bytes_received': 0,
         }
 
-        # Logging - Open with UTF-8 encoding for safety
+        # Logging
         self.log_file = open('server_log.txt', 'w', encoding='utf-8', errors='replace')
 
-        print(f"[START] Server started on port {PORT} (Optimized for 4 players)")
+        # Metrics
+        self.metrics_file = open('server_metrics.csv', 'w', newline='')
+        self.csv_writer = csv.writer(self.metrics_file)
+        self.csv_writer.writerow(['timestamp', 'cpu_percent', 'clients_connected',
+                                  'packets_sent', 'packets_received', 'bandwidth_kbps'])
+        self.last_metrics_time = time.time()
+        self.last_bytes_total = 0
+
+        print(f"[START] Robust UDP Server started on port {PORT}")
 
     def _get_timestamp(self):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
 
     def log(self, msg, prefix="[SERVER]"):
-        """Safe logging"""
         timestamp = self._get_timestamp()
-
-        # Remove any non-ASCII characters from message
         safe_msg = ''.join(char for char in str(msg) if ord(char) < 128)
-
         full_msg = f"{timestamp} - {prefix} {safe_msg}"
-
-        # Always print to console for monitoring
         print(full_msg)
-
-        # Write to file
         self.log_file.write(full_msg + "\n")
         self.log_file.flush()
 
     def send_packet_safe(self, addr, msg_type, snapshot_id, seq_num, payload=b''):
-        """Safe packet sending with error handling"""
+        """
+        Send a packet and return success status and server timestamp (in ms).
+        Returns: (bool success, int server_timestamp_ms)
+        """
         try:
-            # Quick compression check
-            if len(payload) > 200 and msg_type not in [MSG_TYPES['HEARTBEAT'], MSG_TYPES['WELCOME']]:
+            # Compression should only be done for SNAPSHOT or FULL_SNAPSHOT if not already compressed
+            if msg_type == MSG_TYPES['SNAPSHOT'] and len(payload) > 200:
                 compressed = zlib.compress(payload, level=1)
                 if len(compressed) < len(payload):
                     payload = compressed
                     msg_type = MSG_TYPES['COMPRESSED']
 
-            timestamp = int(time.time() * 1000)
+            if msg_type not in [MSG_TYPES['COMPRESSED'], MSG_TYPES['FULL_SNAPSHOT']] and len(payload) > 200:
+                # Standard compression for other large payloads if needed
+                compressed = zlib.compress(payload, level=1)
+                if len(compressed) < len(payload):
+                    payload = compressed
+                    # Do not change the msg_type if it is not a snapshot
+
+            timestamp_ms = int(time.time() * 1000) # Capture server timestamp
+            # Check for max payload size (1172 bytes)
+            if len(payload) > (MAX_PACKET_SIZE - HEADER_SIZE):
+                self.log(
+                    f"WARN: Payload size {len(payload)} exceeds max packet payload {MAX_PACKET_SIZE - HEADER_SIZE}",
+                    prefix="[WARN]")
+                return False, 0
+
             payload_len = len(payload)
             checksum = compute_checksum(payload)
 
             header = create_header(msg_type, snapshot_id, seq_num, payload_len, checksum)
             data = header + payload
 
-            # Send with timeout
-            self.sock.settimeout(0.5)
             self.sock.sendto(data, addr)
-            self.sock.setblocking(False)
-
-            # Update stats
             self.stats['packets_sent'] += 1
             self.stats['bytes_sent'] += len(data)
+            return True, timestamp_ms
+        except Exception:
+            return False, 0
 
-            return True
+    def _get_full_grid_payload(self) -> bytes:
+        """Helper to create a full grid state for late-joiners"""
+        payload = bytearray()
+        # Full grid (400 bytes for 20x20)
+        for row in self.game.grid:
+            payload.extend(row)
 
-        except socket.timeout:
-            self.log(f"Timeout sending to {addr}", prefix="[WARN]")
-            return False
-        except ConnectionResetError:
-            # Client disconnected, remove it
-            with self.clients_lock:
-                if addr in self.clients:
-                    client_info = self.clients[addr]
-                    self.log(f"Client {client_info.player_id} disconnected (connection reset)", prefix="[DISCONNECT]")
-                    self.disconnect_client(addr, client_info.player_id, "connection reset")
-            return False
-        except Exception as e:
-            self.log(f"Send error to {addr}: {e}", prefix="[ERROR]")
-            return False
+        # Player positions
+        payload.append(len(self.game.players))
+        for pid, pos in self.game.players.items():
+            payload.extend(struct.pack('BBB', pid, pos[0], pos[1]))
 
-    def broadcast_snapshot_to_all(self):
-        """Broadcast game snapshot to ALL connected clients"""
+        # Scores
+        scores_arr = self.game._get_scores_array()
+        payload.extend(struct.pack('BBBB', scores_arr[1], scores_arr[2], scores_arr[3], scores_arr[4]))
+
+        # Events (active) - simple list of row, col, type, id
+        active_events = [e for e in self.game.events.values() if not e.collected]
+        payload.append(len(active_events))
+        for event in active_events:
+            payload.extend(struct.pack('BBBB', event.event_id, event.event_type, event.row, event.col))
+
+        # Player events
         current_time = time.time()
+        payload.append(len(self.game.player_events))
+        for pid, pevent in self.game.player_events.items():
+            remaining_ms = int(pevent.get_remaining_time(current_time) * 1000)
+            payload.extend(struct.pack('BB', pid, pevent.event_type))
+            payload.extend(struct.pack('>I', remaining_ms))
 
-        # Only broadcast at 30Hz
-        if current_time - self.last_snapshot_time < UPDATE_INTERVAL:
-            return
-
-        self.last_snapshot_time = current_time
-        self.snapshot_id += 1
-
-        # Update game events
-        self.game.update_events()
-
-        # Generate snapshot data once
-        is_compressed, snapshot_data = self.game.get_compressed_snapshot(0)
-
-        # Handle event spawning
-        if current_time - self.last_event_spawn_time >= EVENT_SPAWN_INTERVAL:
-            event = self.game.spawn_event()
-            if event:
-                self.log(f"Spawned Star at ({event.row},{event.col})", prefix="[EVENT]")
-                event_payload = struct.pack('BBBB', event.event_id, event.event_type,
-                                            event.row, event.col)
-                self.broadcast_message_to_all(MSG_TYPES['EVENT_SPAWN'], event_payload)
-            self.last_event_spawn_time = current_time
-
-        # Get all clients quickly
-        with self.clients_lock:
-            clients_list = list(self.clients.items())
-
-        # Send snapshot to each client
-        for addr, client_info in clients_list:
-            try:
-                # Send snapshot
-                msg_type = MSG_TYPES['COMPRESSED'] if is_compressed else MSG_TYPES['SNAPSHOT']
-                success = self.send_packet_safe(addr, msg_type, self.snapshot_id,
-                                                client_info.sequence_counter, snapshot_data)
-
-                if success:
-                    client_info.sequence_counter += 1
-                    client_info.last_snapshot_time = current_time
-
-            except Exception as e:
-                self.log(f"Failed to send snapshot to {addr}: {e}", prefix="[ERROR]")
-
-    def broadcast_message_to_all(self, msg_type, payload=b''):
-        """Broadcast a message to all clients"""
-        with self.clients_lock:
-            clients_list = list(self.clients.keys())
-
-        for addr in clients_list:
-            try:
-                with self.clients_lock:
-                    client_info = self.clients.get(addr)
-                    if client_info:
-                        seq = client_info.sequence_counter
-                        self.send_packet_safe(addr, msg_type, 0, seq, payload)
-                        client_info.sequence_counter += 1
-            except:
-                pass
+        # Compress the full snapshot
+        compressed = zlib.compress(bytes(payload), level=1)
+        return compressed
 
     def handle_connect(self, addr):
-        """Handle new client connection"""
+        """Robust Connection Handling"""
         with self.clients_lock:
-            # Check if already connected
+            # 1. Idempotency Check: Is this client already connected?
             if addr in self.clients:
-                client_info = self.clients[addr]
-                client_info.last_heartbeat = time.time()
-                self.log(f"Client reconnected: {addr[0]}:{addr[1]}", prefix="[CONNECT]")
+                client = self.clients[addr]
+                # Re-send WELCOME (ACK) in case the previous one was lost
+                payload = struct.pack('BB', client.player_id, self.game.grid_size)
+                self.send_packet_safe(addr, MSG_TYPES['WELCOME'], 0, 0, payload)
+                self.log(f"Resent WELCOME to existing client {client.player_id}", prefix="[RECONNECT]")
                 return
 
-            # Check server capacity
+            # 2. Capacity Check
             if len(self.clients) >= 4:
-                self.log(f"Server full, rejecting: {addr[0]}:{addr[1]}", prefix="[WARN]")
+                self.log(f"Server full, rejecting: {addr}", prefix="[WARN]")
                 return
 
-            # Find free player ID
+            # 3. Assign New Player ID
             player_id = None
             for pid in range(1, 5):
                 if pid not in self.player_to_addr:
                     player_id = pid
                     break
 
-            if not player_id:
-                self.log("No free player IDs", prefix="[ERROR]")
+            if not player_id: return
+
+            # 4. Add to Game
+            if self.game.add_player(player_id):
+                client_info = ClientInfo(addr, player_id)
+                self.clients[addr] = client_info
+                self.player_to_addr[player_id] = addr
+                self.log(f"Player {player_id} connected from {addr}", prefix="[CONNECT]")
+            else:
                 return
 
-            # Add player to game
-            if not self.game.add_player(player_id):
-                self.log(f"Failed to add player {player_id} to game", prefix="[ERROR]")
-                return
-
-            # Create client info
-            client_info = ClientInfo(addr, player_id)
-            self.clients[addr] = client_info
-            self.player_to_addr[player_id] = addr
-
-            self.log(f"Player {player_id} connected from {addr[0]}:{addr[1]}", prefix="[CONNECT]")
-
-        # Send welcome message
+        # 5. Send WELCOME
         payload = struct.pack('BB', player_id, self.game.grid_size)
         self.send_packet_safe(addr, MSG_TYPES['WELCOME'], 0, 0, payload)
 
-        # Send current events
-        game_state = self.game.get_state()
-        for event_id, event_data in game_state['events'].items():
-            if not event_data['collected']:
-                event_payload = struct.pack('BBBB', event_id, event_data['type'],
-                                            event_data['row'], event_data['col'])
-                self.send_packet_safe(addr, MSG_TYPES['EVENT_SPAWN'], 0, 1, event_payload)
+        # 6. Send Full Snapshot for Catch-Up
+        full_state_payload = self._get_full_grid_payload()
+        self.send_packet_safe(addr, MSG_TYPES['FULL_SNAPSHOT'], self.snapshot_id,
+                              self.clients[addr].sequence_counter, full_state_payload)
+        self.clients[addr].sequence_counter += 1
+        self.clients[addr].last_acked_snapshot_id = self.snapshot_id  # Treat full snapshot as acknowledged
 
-    def handle_move(self, player_id, direction):
-        """Handle player movement"""
-        with self.clients_lock:
-            if player_id not in self.player_to_addr:
-                return
-
-        # Process move in game
-        result = self.game.move_player(player_id, direction)
-
-        # Broadcast event collection if needed
-        if result.get('success') and result.get('event_collected'):
-            event_data = result['event_collected']
-            collect_payload = struct.pack('BBBB',
-                                          event_data['event_id'],
-                                          event_data['event_type'],
-                                          player_id, 0)
-            self.broadcast_message_to_all(MSG_TYPES['EVENT_COLLECT'], collect_payload)
-
-            # Special announcement for star collection
-            if event_data['event_type'] == EVENT_STAR:
-                self.log(f"Player {player_id} collected a STAR!", prefix="[EVENT]")
-
-    def handle_claim(self, player_id, addr):
-        """Handle cell claim"""
-        with self.clients_lock:
-            if player_id not in self.player_to_addr:
-                return
-
-        # Process claim
-        result = self.game.claim_cell(player_id)
-
-        # Send response
-        if result['success']:
-            row, col = result['position']
-            with self.clients_lock:
-                client_info = self.clients.get(addr)
-                if client_info:
-                    seq = client_info.sequence_counter
-                    self.send_packet_safe(addr, MSG_TYPES['ACK'], 0, seq,
-                                          struct.pack('BB', row, col))
-                    client_info.sequence_counter += 1
-
-            self.log(f"P{player_id} claimed ({row},{col})", prefix="[CLAIM]")
-
-            if result['game_over']:
-                self.handle_game_over(result)
-        else:
-            row, col = result['position']
-            with self.clients_lock:
-                client_info = self.clients.get(addr)
-                if client_info:
-                    seq = client_info.sequence_counter
-                    self.send_packet_safe(addr, MSG_TYPES['NACK'], 0, seq,
-                                          struct.pack('BB', row, col))
-                    client_info.sequence_counter += 1
-
-    def handle_game_over(self, result):
-        """Handle game over"""
-        winner = result['winner']
-        win_reason = result.get('win_reason', 'Game ended')
-        scores = result['scores']
-
-        win_reason_bytes = win_reason.encode('utf-8')
-        payload = struct.pack('BB', winner, len(win_reason_bytes)) + win_reason_bytes
-        payload += struct.pack('BBBB', scores[1], scores[2], scores[3], scores[4])
-
-        self.broadcast_message_to_all(MSG_TYPES['GAME_OVER'], payload)
-
-        self.log(f"GAME OVER! Winner: Player {winner} ({win_reason})", prefix="[GAME]")
-
-        # Auto-shutdown after 10 seconds
-        threading.Timer(10.0, self.initiate_shutdown).start()
-
-    def initiate_shutdown(self):
-        self.log("Initiating graceful shutdown...", prefix="[SHUTDOWN]")
-        self.running = False
-
-    def check_client_timeouts(self):
-        """Remove inactive clients"""
+    def broadcast_snapshot_to_all(self):
         current_time = time.time()
-        to_remove = []
+        if current_time - self.last_snapshot_time < UPDATE_INTERVAL: return
+
+        self.last_snapshot_time = current_time
+        self.snapshot_id += 1
+        self.game.update_events()
+
+        # Calculate and cache the current snapshot data for history
+        is_compressed, snapshot_data = self.game.get_compressed_snapshot(0)
+        self.snapshot_history[self.snapshot_id] = (is_compressed, snapshot_data)
+
+        # Prune history
+        min_acked_id = self.snapshot_id - MAX_SNAPSHOT_HISTORY
+        if self.clients:
+            min_acked_id = min(min_acked_id, min(c.last_acked_snapshot_id for c in self.clients.values()))
+
+        keys_to_delete = [k for k in self.snapshot_history if k < min_acked_id]
+        for k in keys_to_delete:
+            del self.snapshot_history[k]
+
+        # Spawns
+        if current_time - self.last_event_spawn_time >= EVENT_SPAWN_INTERVAL:
+            event = self.game.spawn_event()
+            if event:
+                ep = struct.pack('BBBB', event.event_id, event.event_type, event.row, event.col)
+                self.broadcast_message_to_all(MSG_TYPES['EVENT_SPAWN'], ep)
+            self.last_event_spawn_time = current_time
 
         with self.clients_lock:
-            for addr, client_info in list(self.clients.items()):
-                # 60 second timeout for all clients (bots might be slow)
-                if current_time - client_info.last_heartbeat > 60.0:
-                    to_remove.append((addr, client_info.player_id))
+            clients_list = list(self.clients.items())
 
-        for addr, player_id in to_remove:
-            self.disconnect_client(addr, player_id, "timeout")
+        for addr, client_info in clients_list:
+            # Send the current snapshot data
+            msg_type = MSG_TYPES['COMPRESSED'] if is_compressed else MSG_TYPES['SNAPSHOT']
+            # We ignore the returned timestamp here, but the timestamp is correctly embedded in the header by send_packet_safe
+            if self.send_packet_safe(addr, msg_type, self.snapshot_id, client_info.sequence_counter, snapshot_data)[0]:
+                client_info.sequence_counter += 1
+                client_info.last_snapshot_time = current_time
 
-    def disconnect_client(self, addr, player_id, reason="disconnected"):
-        """Cleanly disconnect a client"""
+    def broadcast_message_to_all(self, msg_type, payload=b''):
         with self.clients_lock:
-            if addr in self.clients:
-                del self.clients[addr]
-            if player_id in self.player_to_addr:
-                del self.player_to_addr[player_id]
-
-        # Remove from game
-        if player_id in self.game.players:
-            self.game.players.pop(player_id)
-
-        self.log(f"Player {player_id} {reason} ({addr[0]}:{addr[1]})", prefix="[DISCONNECT]")
+            clients_list = list(self.clients.keys())
+        for addr in clients_list:
+            client = self.clients.get(addr)
+            if client:
+                # We ignore the returned timestamp here
+                self.send_packet_safe(addr, msg_type, 0, client.sequence_counter, payload)
+                client.sequence_counter += 1
 
     def receive_packets(self):
-        """Non-blocking packet reception"""
         try:
-            # Read all available packets
             while True:
-                try:
-                    data, addr = self.sock.recvfrom(4096)
-                    self.handle_packet(data, addr)
-
-                    # Update stats
-                    self.stats['packets_received'] += 1
-                    self.stats['bytes_received'] += len(data)
-
-                except BlockingIOError:
-                    # No more data
-                    break
-                except ConnectionResetError:
-                    # Silently handle connection reset (already handled in send_packet_safe)
-                    break
-                except Exception as e:
-                    # Don't log common errors to avoid spam
-                    break
-
-        except Exception as e:
-            # Don't log loop errors to avoid spam
+                data, addr = self.sock.recvfrom(4096)
+                self.handle_packet(data, addr)
+                self.stats['packets_received'] += 1
+                self.stats['bytes_received'] += len(data)
+        except BlockingIOError:
+            pass
+        except Exception:
             pass
 
     def handle_packet(self, data, addr):
-        """Process incoming packet"""
-        if len(data) < HEADER_SIZE:
-            return
-
+        if len(data) < HEADER_SIZE: return
         try:
             header = parse_header(data[:HEADER_SIZE])
-            if not header:
-                return
-
-            protocol_id, version, msg_type, snapshot_id, seq_num, timestamp, payload_len, checksum = header
-
-            # Validate protocol
-            if protocol_id != PROTO_ID or version != VERSION:
-                return
-
+            if not header: return
+            _, _, msg_type, snapshot_id, _, timestamp, payload_len, checksum = header
             payload = data[HEADER_SIZE:]
-            if len(payload) != payload_len:
-                return
+            if len(payload) != payload_len or compute_checksum(payload) != checksum: return
 
-            if compute_checksum(payload) != checksum:
-                return
-
-            # Handle compressed payload
             if msg_type == MSG_TYPES['COMPRESSED']:
-                try:
-                    payload = zlib.decompress(payload)
-                    msg_type = MSG_TYPES['SNAPSHOT']
-                except:
-                    return
+                payload = zlib.decompress(payload)
+                msg_type = MSG_TYPES['SNAPSHOT']  # Assume compressed snapshot is a delta snapshot
 
-            # Calculate latency
-            latency = max(0, int(time.time() * 1000) - timestamp)
-
-            # Get client info
-            with self.clients_lock:
-                client_info = self.clients.get(addr)
-
-            # Handle message types
+            # Handle CONNECT immediately (no login check needed)
             if msg_type == MSG_TYPES['CONNECT']:
                 self.handle_connect(addr)
+                return
 
+            # Check Login for other packets
+            with self.clients_lock:
+                client = self.clients.get(addr)
+            if not client: return
+
+            # Stats Update
+            latency = max(0, int(time.time() * 1000) - timestamp)
+            client.last_heartbeat = time.time()
+            client.avg_latency = client.avg_latency * 0.9 + latency * 0.1
+
+            if msg_type == MSG_TYPES['MOVE']:
+                if len(payload) == 1:
+                    self.handle_move(client.player_id, struct.unpack('B', payload)[0])
+            elif msg_type == MSG_TYPES['CLAIM']:
+                self.handle_claim(client.player_id, addr)
             elif msg_type == MSG_TYPES['HEARTBEAT']:
-                if client_info:
-                    client_info.last_heartbeat = time.time()
-                    client_info.avg_latency = client_info.avg_latency * 0.9 + latency * 0.1
-                    # Send response
-                    with self.clients_lock:
-                        seq = client_info.sequence_counter
-                        self.send_packet_safe(addr, MSG_TYPES['HEARTBEAT'], 0, seq)
-                        client_info.sequence_counter += 1
-
+                self.send_packet_safe(addr, MSG_TYPES['HEARTBEAT'], 0, client.sequence_counter)
+                client.sequence_counter += 1
             elif msg_type == MSG_TYPES['ACK_SNAPSHOT']:
-                # Just acknowledge, no processing needed
-                pass
+                # Update the client's last acknowledged snapshot ID
+                client.last_acked_snapshot_id = max(client.last_acked_snapshot_id, snapshot_id)
 
-            elif msg_type == MSG_TYPES['RESEND_REQUEST']:
-                # Ignore resend requests for now (snapshots are sent regularly)
-                pass
-
-            elif client_info:
-                # Update heartbeat for any valid packet
-                client_info.last_heartbeat = time.time()
-                client_info.avg_latency = client_info.avg_latency * 0.9 + latency * 0.1
-
-                # Process inputs immediately
-                if msg_type == MSG_TYPES['MOVE']:
-                    if len(payload) == 1:
-                        direction = struct.unpack('B', payload)[0]
-                        # Process immediately for responsiveness
-                        self.handle_move(client_info.player_id, direction)
-
-                elif msg_type == MSG_TYPES['CLAIM']:
-                    # Process immediately
-                    self.handle_claim(client_info.player_id, addr)
-
-        except Exception as e:
-            # Don't log packet handling errors to avoid spam
+        except Exception:
             pass
 
-    def game_loop(self):
-        """Main game processing loop"""
-        last_timeout_check = time.time()
-        stats_timer = time.time()
+    def handle_move(self, player_id, direction):
+        result = self.game.move_player(player_id, direction)
+        if result.get('success') and result.get('event_collected'):
+            ed = result['event_collected']
+            pl = struct.pack('BBBB', ed['event_id'], ed['event_type'], player_id, 0)
+            self.broadcast_message_to_all(MSG_TYPES['EVENT_COLLECT'], pl)
 
-        while self.running:
-            try:
-                current_time = time.time()
+    def handle_claim(self, player_id, addr):
+        result = self.game.claim_cell(player_id)
+        msg_type = MSG_TYPES['ACK'] if result['success'] else MSG_TYPES['NACK']
+        row, col = result['position']
+        with self.clients_lock:
+            client = self.clients.get(addr)
+            if client:
+                self.send_packet_safe(addr, msg_type, 0, client.sequence_counter, struct.pack('BB', row, col))
+                client.sequence_counter += 1
+        if result.get('game_over'): self.handle_game_over(result)
 
-                # 1. Process network packets
-                self.receive_packets()
+    def handle_game_over(self, result):
+        winner = result['winner']
+        reason = result.get('win_reason', 'Game Over').encode('utf-8')
+        scores = result['scores']
+        payload = struct.pack('BB', winner, len(reason)) + reason
+        payload += struct.pack('BBBB', scores[1], scores[2], scores[3], scores[4])
+        self.broadcast_message_to_all(MSG_TYPES['GAME_OVER'], payload)
+        self.log(f"Game Over. Winner: {winner}")
+        threading.Timer(10.0, self.initiate_shutdown).start()
 
-                # 2. Broadcast snapshots at 30Hz
-                self.broadcast_snapshot_to_all()
+    def initiate_shutdown(self):
+        self.running = False
 
-                # 3. Check for client timeouts every 10 seconds
-                if current_time - last_timeout_check > 10.0:
-                    self.check_client_timeouts()
-                    last_timeout_check = current_time
+    def check_client_timeouts(self):
+        curr = time.time()
+        to_remove = []
+        with self.clients_lock:
+            for addr, client in self.clients.items():
+                if curr - client.last_heartbeat > 60.0:
+                    to_remove.append((addr, client.player_id))
+        for addr, pid in to_remove:
+            self.disconnect_client(addr, pid, "timeout")
 
-                # 4. Print stats every 30 seconds
-                if current_time - stats_timer > 30.0:
-                    with self.clients_lock:
-                        client_count = len(self.clients)
-                    self.log(f"Status: {client_count}/4 clients connected", prefix="[STATUS]")
-                    stats_timer = current_time
+    def disconnect_client(self, addr, pid, reason):
+        with self.clients_lock:
+            if addr in self.clients: del self.clients[addr]
+            if pid in self.player_to_addr: del self.player_to_addr[pid]
+        if pid in self.game.players: self.game.players.pop(pid)
+        self.log(f"Player {pid} disconnected: {reason}")
 
-                # 5. Small sleep to prevent CPU spinning
-                time.sleep(0.01)  # ~100Hz polling
-
-            except Exception as e:
-                # Don't log loop errors
-                pass
+    def update_metrics(self):
+        curr = time.time()
+        if curr - self.last_metrics_time >= 1.0:
+            total_bytes = self.stats['bytes_sent'] + self.stats['bytes_received']
+            # Calculate bandwidth in Kbps (kilobits per second)
+            bw = ((total_bytes - self.last_bytes_total) * 8) / (1000 * (curr - self.last_metrics_time))
+            cpu = psutil.cpu_percent() if psutil else 0.0
+            with self.clients_lock: count = len(self.clients)
+            self.csv_writer.writerow([f"{curr:.2f}", f"{cpu:.1f}", count,
+                                      self.stats['packets_sent'], self.stats['packets_received'], f"{bw:.2f}"])
+            self.metrics_file.flush()
+            self.last_metrics_time = curr
+            self.last_bytes_total = total_bytes
 
     def run(self):
-        """Main server entry point"""
-        print("\n" + "=" * 60)
-        print("GRID CLASH SERVER - FIXED VERSION")
-        print("=" * 60)
-        print(f"Port: {PORT}")
-        print(f"Max Players: 4")
-        print(f"Update Rate: {UPDATE_HZ}Hz")
-        print(f"Grid Size: {GRID_SIZE}x{GRID_SIZE}")
-        print("=" * 60)
-        print("Waiting for players...")
-        print("Start clients with:")
-        print("  Human: python client.py")
-        print("  Bot:   python client.py auto BotName")
-        print("=" * 60 + "\n")
-
-        try:
-            # Run everything in the main thread for simplicity
-            self.game_loop()
-
-        except KeyboardInterrupt:
-            self.log("Shutdown requested by user", prefix="[INFO]")
-            self.running = False
-        except Exception as e:
-            self.log(f"Server crashed: {e}", prefix="[CRITICAL]")
-            self.running = False
-
-        self.cleanup()
-
-    def cleanup(self):
-        """Clean shutdown"""
-        runtime = time.time() - self.start_time
-
-        # Get final game state
-        game_state = self.game.get_state()
-
-        # Close files
+        last_chk = time.time()
+        while self.running:
+            try:
+                self.receive_packets()
+                self.broadcast_snapshot_to_all()
+                self.update_metrics()
+                if time.time() - last_chk > 10.0:
+                    self.check_client_timeouts()
+                    last_chk = time.time()
+                time.sleep(0.01)
+            except KeyboardInterrupt:
+                self.running = False
+            except Exception:
+                pass
         self.log_file.close()
-
-        try:
-            self.sock.close()
-        except:
-            pass
-
-        # Final statistics
-        print("\n" + "=" * 60)
-        print("SERVER SHUTDOWN STATISTICS")
-        print("=" * 60)
-        print(f"Runtime: {runtime:.1f} seconds")
-        print(f"Packets Sent: {self.stats['packets_sent']}")
-        print(f"Packets Received: {self.stats['packets_received']}")
-        print(f"Final Scores:")
-        for pid in range(1, 5):
-            score = game_state['scores'].get(pid, 0)
-            print(f"  Player {pid}: {score}/200")
-
-        if game_state['game_over']:
-            print(f"\nWinner: Player {game_state['winner']}")
-            print(f"Reason: {game_state.get('win_reason', 'Game ended')}")
-
-        print("=" * 60)
+        self.metrics_file.close()
+        self.sock.close()
 
 
-if __name__ == '__main__':
-    server = Server()
-    server.run()
+if __name__ == '__main__': Server().run()
