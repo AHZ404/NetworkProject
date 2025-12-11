@@ -4,8 +4,8 @@ import zlib
 import time
 
 # Protocol constants
-PROTO_ID = b'MPGP'  # Multiplayer Game Protocol
-VERSION = 2  # Increased to v2 for new features
+PROTO_ID = b'GUDP' #GAMING UDP
+VERSION = 2
 HEADER_FMT = '>4sBBIIQHI'  # protocol_id (4s), version (B), msg_type (B), snapshot_id (I), seq_num (I), timestamp (Q), payload_len (H), checksum (I)
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
@@ -28,11 +28,11 @@ MSG_TYPES = {
 }
 
 # Network settings
-UPDATE_HZ = 30  # Increased from 20 to 30 for smoother updates
+UPDATE_HZ = 30
 UPDATE_INTERVAL = 1.0 / UPDATE_HZ
 HOST = '127.0.0.1'
 PORT = 1234
-MAX_PACKET_SIZE = 1200 # Max packet size in bytes (Constraint)
+MAX_PACKET_SIZE = 1200
 
 # Visualization
 CELL_SIZE = 30

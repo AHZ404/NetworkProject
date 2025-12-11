@@ -26,7 +26,7 @@ class ClientInfo:
         self.last_snapshot_time = 0
         self.avg_latency = 0
         self.sequence_counter = 0
-        self.last_acked_snapshot_id = 0  # Track last acknowledged snapshot
+        self.last_acked_snapshot_id = 0
 
 
 class Server:
@@ -46,7 +46,7 @@ class Server:
         self.player_to_addr: Dict[int, tuple] = {}
         self.clients_lock = threading.Lock()
 
-        # Snapshot history buffer: {snapshot_id: (is_compressed, data)}
+        # Snapshot history buffer
         self.snapshot_history: Dict[int, Tuple[bool, bytes]] = {}
         self.snapshot_id = 0
 
@@ -69,10 +69,18 @@ class Server:
         self.csv_writer = csv.writer(self.metrics_file)
         self.csv_writer.writerow(['timestamp', 'cpu_percent', 'clients_connected',
                                   'packets_sent', 'packets_received', 'bandwidth_kbps'])
+
+        # --- NEW: Position Logging for "Perceived Error" Analysis ---
+        self.pos_log_file = open('server_position_log.csv', 'w', newline='')
+        self.pos_writer = csv.writer(self.pos_log_file)
+        # Writes authoritative position: Time, PlayerID, Row, Col
+        self.pos_writer.writerow(['time', 'player_id', 'row', 'col'])
+
         self.last_metrics_time = time.time()
         self.last_bytes_total = 0
 
-        print(f"[START] Robust UDP Server started on port {PORT}")
+        # --- LOG ACTION: Listening ---
+        self.log(f"Server initialized. Listening on port {PORT}...", prefix="[STARTUP]")
 
     def _get_timestamp(self):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
@@ -86,12 +94,7 @@ class Server:
         self.log_file.flush()
 
     def send_packet_safe(self, addr, msg_type, snapshot_id, seq_num, payload=b''):
-        """
-        Send a packet and return success status and server timestamp (in ms).
-        Returns: (bool success, int server_timestamp_ms)
-        """
         try:
-            # Compression should only be done for SNAPSHOT or FULL_SNAPSHOT if not already compressed
             if msg_type == MSG_TYPES['SNAPSHOT'] and len(payload) > 200:
                 compressed = zlib.compress(payload, level=1)
                 if len(compressed) < len(payload):
@@ -99,18 +102,13 @@ class Server:
                     msg_type = MSG_TYPES['COMPRESSED']
 
             if msg_type not in [MSG_TYPES['COMPRESSED'], MSG_TYPES['FULL_SNAPSHOT']] and len(payload) > 200:
-                # Standard compression for other large payloads if needed
                 compressed = zlib.compress(payload, level=1)
                 if len(compressed) < len(payload):
                     payload = compressed
-                    # Do not change the msg_type if it is not a snapshot
 
-            timestamp_ms = int(time.time() * 1000) # Capture server timestamp
-            # Check for max payload size (1172 bytes)
+            timestamp_ms = int(time.time() * 1000)
             if len(payload) > (MAX_PACKET_SIZE - HEADER_SIZE):
-                self.log(
-                    f"WARN: Payload size {len(payload)} exceeds max packet payload {MAX_PACKET_SIZE - HEADER_SIZE}",
-                    prefix="[WARN]")
+                self.log(f"WARN: Payload size {len(payload)} exceeds max", prefix="[WARN]")
                 return False, 0
 
             payload_len = len(payload)
@@ -127,57 +125,41 @@ class Server:
             return False, 0
 
     def _get_full_grid_payload(self) -> bytes:
-        """Helper to create a full grid state for late-joiners"""
         payload = bytearray()
-        # Full grid (400 bytes for 20x20)
         for row in self.game.grid:
             payload.extend(row)
-
-        # Player positions
         payload.append(len(self.game.players))
         for pid, pos in self.game.players.items():
             payload.extend(struct.pack('BBB', pid, pos[0], pos[1]))
-
-        # Scores
         scores_arr = self.game._get_scores_array()
         payload.extend(struct.pack('BBBB', scores_arr[1], scores_arr[2], scores_arr[3], scores_arr[4]))
-
-        # Events (active) - simple list of row, col, type, id
         active_events = [e for e in self.game.events.values() if not e.collected]
         payload.append(len(active_events))
         for event in active_events:
             payload.extend(struct.pack('BBBB', event.event_id, event.event_type, event.row, event.col))
-
-        # Player events
         current_time = time.time()
         payload.append(len(self.game.player_events))
         for pid, pevent in self.game.player_events.items():
             remaining_ms = int(pevent.get_remaining_time(current_time) * 1000)
             payload.extend(struct.pack('BB', pid, pevent.event_type))
             payload.extend(struct.pack('>I', remaining_ms))
-
-        # Compress the full snapshot
         compressed = zlib.compress(bytes(payload), level=1)
         return compressed
 
     def handle_connect(self, addr):
-        """Robust Connection Handling"""
         with self.clients_lock:
-            # 1. Idempotency Check: Is this client already connected?
             if addr in self.clients:
                 client = self.clients[addr]
-                # Re-send WELCOME (ACK) in case the previous one was lost
                 payload = struct.pack('BB', client.player_id, self.game.grid_size)
                 self.send_packet_safe(addr, MSG_TYPES['WELCOME'], 0, 0, payload)
-                self.log(f"Resent WELCOME to existing client {client.player_id}", prefix="[RECONNECT]")
+                # --- LOG ACTION: Re-Connection ---
+                self.log(f"Client re-connected (Player {client.player_id}) from {addr}", prefix="[RECONNECT]")
                 return
 
-            # 2. Capacity Check
             if len(self.clients) >= 4:
                 self.log(f"Server full, rejecting: {addr}", prefix="[WARN]")
                 return
 
-            # 3. Assign New Player ID
             player_id = None
             for pid in range(1, 5):
                 if pid not in self.player_to_addr:
@@ -186,25 +168,23 @@ class Server:
 
             if not player_id: return
 
-            # 4. Add to Game
             if self.game.add_player(player_id):
                 client_info = ClientInfo(addr, player_id)
                 self.clients[addr] = client_info
                 self.player_to_addr[player_id] = addr
-                self.log(f"Player {player_id} connected from {addr}", prefix="[CONNECT]")
+                # --- LOG ACTION: Connection & Joining ---
+                self.log(f"New connection accepted. Assigned Player ID {player_id} to {addr}", prefix="[CONNECT]")
             else:
                 return
 
-        # 5. Send WELCOME
         payload = struct.pack('BB', player_id, self.game.grid_size)
         self.send_packet_safe(addr, MSG_TYPES['WELCOME'], 0, 0, payload)
 
-        # 6. Send Full Snapshot for Catch-Up
         full_state_payload = self._get_full_grid_payload()
         self.send_packet_safe(addr, MSG_TYPES['FULL_SNAPSHOT'], self.snapshot_id,
                               self.clients[addr].sequence_counter, full_state_payload)
         self.clients[addr].sequence_counter += 1
-        self.clients[addr].last_acked_snapshot_id = self.snapshot_id  # Treat full snapshot as acknowledged
+        self.clients[addr].last_acked_snapshot_id = self.snapshot_id
 
     def broadcast_snapshot_to_all(self):
         current_time = time.time()
@@ -214,11 +194,15 @@ class Server:
         self.snapshot_id += 1
         self.game.update_events()
 
-        # Calculate and cache the current snapshot data for history
         is_compressed, snapshot_data = self.game.get_compressed_snapshot(0)
         self.snapshot_history[self.snapshot_id] = (is_compressed, snapshot_data)
 
-        # Prune history
+        # --- NEW: Log Authoritative Positions ---
+        # This writes the ground truth for position error analysis
+        for pid, (r, c) in self.game.players.items():
+            self.pos_writer.writerow([f"{current_time:.6f}", pid, r, c])
+        self.pos_log_file.flush()
+
         min_acked_id = self.snapshot_id - MAX_SNAPSHOT_HISTORY
         if self.clients:
             min_acked_id = min(min_acked_id, min(c.last_acked_snapshot_id for c in self.clients.values()))
@@ -227,21 +211,21 @@ class Server:
         for k in keys_to_delete:
             del self.snapshot_history[k]
 
-        # Spawns
         if current_time - self.last_event_spawn_time >= EVENT_SPAWN_INTERVAL:
             event = self.game.spawn_event()
             if event:
                 ep = struct.pack('BBBB', event.event_id, event.event_type, event.row, event.col)
                 self.broadcast_message_to_all(MSG_TYPES['EVENT_SPAWN'], ep)
+                # --- LOG ACTION: Event Spawn (optional context) ---
+                self.log(f"Spawned Event {event.event_id} (Type {event.event_type}) at {event.row},{event.col}",
+                         prefix="[GAME]")
             self.last_event_spawn_time = current_time
 
         with self.clients_lock:
             clients_list = list(self.clients.items())
 
         for addr, client_info in clients_list:
-            # Send the current snapshot data
             msg_type = MSG_TYPES['COMPRESSED'] if is_compressed else MSG_TYPES['SNAPSHOT']
-            # We ignore the returned timestamp here, but the timestamp is correctly embedded in the header by send_packet_safe
             if self.send_packet_safe(addr, msg_type, self.snapshot_id, client_info.sequence_counter, snapshot_data)[0]:
                 client_info.sequence_counter += 1
                 client_info.last_snapshot_time = current_time
@@ -252,7 +236,6 @@ class Server:
         for addr in clients_list:
             client = self.clients.get(addr)
             if client:
-                # We ignore the returned timestamp here
                 self.send_packet_safe(addr, msg_type, 0, client.sequence_counter, payload)
                 client.sequence_counter += 1
 
@@ -279,19 +262,16 @@ class Server:
 
             if msg_type == MSG_TYPES['COMPRESSED']:
                 payload = zlib.decompress(payload)
-                msg_type = MSG_TYPES['SNAPSHOT']  # Assume compressed snapshot is a delta snapshot
+                msg_type = MSG_TYPES['SNAPSHOT']
 
-            # Handle CONNECT immediately (no login check needed)
             if msg_type == MSG_TYPES['CONNECT']:
                 self.handle_connect(addr)
                 return
 
-            # Check Login for other packets
             with self.clients_lock:
                 client = self.clients.get(addr)
             if not client: return
 
-            # Stats Update
             latency = max(0, int(time.time() * 1000) - timestamp)
             client.last_heartbeat = time.time()
             client.avg_latency = client.avg_latency * 0.9 + latency * 0.1
@@ -305,7 +285,6 @@ class Server:
                 self.send_packet_safe(addr, MSG_TYPES['HEARTBEAT'], 0, client.sequence_counter)
                 client.sequence_counter += 1
             elif msg_type == MSG_TYPES['ACK_SNAPSHOT']:
-                # Update the client's last acknowledged snapshot ID
                 client.last_acked_snapshot_id = max(client.last_acked_snapshot_id, snapshot_id)
 
         except Exception:
@@ -313,15 +292,31 @@ class Server:
 
     def handle_move(self, player_id, direction):
         result = self.game.move_player(player_id, direction)
-        if result.get('success') and result.get('event_collected'):
-            ed = result['event_collected']
-            pl = struct.pack('BBBB', ed['event_id'], ed['event_type'], player_id, 0)
-            self.broadcast_message_to_all(MSG_TYPES['EVENT_COLLECT'], pl)
+
+        if result['success']:
+            # --- LOG ACTION: Change of client position ---
+            old_pos = result['old_position']
+            new_pos = result['new_position']
+            self.log(f"Player {player_id} moved from {old_pos} to {new_pos}", prefix="[MOVE]")
+
+            if result.get('event_collected'):
+                ed = result['event_collected']
+                # --- LOG ACTION: Client got special boost ---
+                self.log(f"Player {player_id} collected BOOST (Type {ed['event_type']}) at {new_pos}!",
+                         prefix="[BOOST]")
+
+                pl = struct.pack('BBBB', ed['event_id'], ed['event_type'], player_id, 0)
+                self.broadcast_message_to_all(MSG_TYPES['EVENT_COLLECT'], pl)
 
     def handle_claim(self, player_id, addr):
         result = self.game.claim_cell(player_id)
         msg_type = MSG_TYPES['ACK'] if result['success'] else MSG_TYPES['NACK']
         row, col = result['position']
+
+        if result['success']:
+            # --- LOG ACTION: Client claim a block ---
+            self.log(f"Player {player_id} successfully CLAIMED block at ({row}, {col})", prefix="[CLAIM]")
+
         with self.clients_lock:
             client = self.clients.get(addr)
             if client:
@@ -333,11 +328,17 @@ class Server:
         winner = result['winner']
         reason = result.get('win_reason', 'Game Over').encode('utf-8')
         scores = result['scores']
+
+        # Pack basic game over info
         payload = struct.pack('BB', winner, len(reason)) + reason
         payload += struct.pack('BBBB', scores[1], scores[2], scores[3], scores[4])
+
+        # Pack server statistics (Sent/Received)
+        # Use 'II' for two unsigned integers (4 bytes each)
+        payload += struct.pack('II', self.stats['packets_sent'], self.stats['packets_received'])
+
         self.broadcast_message_to_all(MSG_TYPES['GAME_OVER'], payload)
-        self.log(f"Game Over. Winner: {winner}")
-        threading.Timer(10.0, self.initiate_shutdown).start()
+        self.log(f"Game Over. Winner: {winner}. Stats sent to clients.")
 
     def initiate_shutdown(self):
         self.running = False
@@ -357,13 +358,12 @@ class Server:
             if addr in self.clients: del self.clients[addr]
             if pid in self.player_to_addr: del self.player_to_addr[pid]
         if pid in self.game.players: self.game.players.pop(pid)
-        self.log(f"Player {pid} disconnected: {reason}")
+        self.log(f"Player {pid} disconnected: {reason}", prefix="[DISCONNECT]")
 
     def update_metrics(self):
         curr = time.time()
         if curr - self.last_metrics_time >= 1.0:
             total_bytes = self.stats['bytes_sent'] + self.stats['bytes_received']
-            # Calculate bandwidth in Kbps (kilobits per second)
             bw = ((total_bytes - self.last_bytes_total) * 8) / (1000 * (curr - self.last_metrics_time))
             cpu = psutil.cpu_percent() if psutil else 0.0
             with self.clients_lock: count = len(self.clients)
@@ -389,6 +389,7 @@ class Server:
             except Exception:
                 pass
         self.log_file.close()
+        self.pos_log_file.close()  # Close position log
         self.metrics_file.close()
         self.sock.close()
 
