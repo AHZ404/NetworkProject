@@ -1,29 +1,29 @@
 # game.py
 """
-Consolidated game logic for Grid Clash
-Contains all game rules, state management, and serialization
+Optimized game logic for Grid Clash
 """
 import random
 import time
 import struct
 import math
 from typing import Dict, Tuple, List, Optional, Set
+import zlib
 
 # Game constants
 GRID_SIZE = 20
-MAX_SCORE_TO_WIN = 200  # New: Game ends when player reaches 200 blocks
+MAX_SCORE_TO_WIN = 200
 COLORS = {
     0: (255, 255, 255),  # Unclaimed - white
-    1: (255, 0, 0),  # Player 1 - red
-    2: (0, 255, 0),  # Player 2 - green
-    3: (0, 0, 255),  # Player 3 - blue
-    4: (255, 255, 0)  # Player 4 - yellow
+    1: (255, 50, 50),  # Player 1 - bright red
+    2: (50, 255, 50),  # Player 2 - bright green
+    3: (50, 100, 255),  # Player 3 - bright blue
+    4: (255, 255, 50)  # Player 4 - bright yellow
 }
 OUTLINE_COLORS = {
-    1: (200, 50, 50),  # Darker red outline
-    2: (50, 200, 50),  # Darker green outline
-    3: (50, 50, 200),  # Darker blue outline
-    4: (200, 200, 50)  # Darker yellow outline
+    1: (200, 0, 0),  # Darker red outline
+    2: (0, 200, 0),  # Darker green outline
+    3: (0, 50, 200),  # Darker blue outline
+    4: (200, 200, 0)  # Darker yellow outline
 }
 EVENT_COLORS = {
     1: (255, 215, 0),  # Gold for star
@@ -37,9 +37,12 @@ DIRECTIONS = {
 
 # Event constants
 EVENT_STAR = 1
-EVENT_DURATION_STAR = 3.0  # 3 seconds
-EVENT_SPAWN_INTERVAL = 3.0  # Every 3 seconds (changed from 5)
-EVENTS_PER_SPAWN = 1  # Always spawn exactly 1 event (no randomness)
+EVENT_DURATION_STAR = 3.0
+EVENT_SPAWN_INTERVAL = 3.0
+MAX_EVENTS_ON_GRID = 5  # Limit simultaneous events
+
+# Movement validation cache
+MOVE_CACHE_SIZE = 100
 
 
 class PlayerEvent:
@@ -52,62 +55,80 @@ class PlayerEvent:
     def is_active(self, current_time: float) -> bool:
         return current_time < self.expiration_time
 
+    def get_remaining_time(self, current_time: float) -> float:
+        return max(0.0, self.expiration_time - current_time)
+
 
 class GameEvent:
     """Represents an event on the grid"""
 
     def __init__(self, event_id: int, event_type: int, row: int, col: int, spawn_time: float):
         self.event_id = event_id
-        self.event_type = event_type  # Only STAR event now
+        self.event_type = event_type
         self.row = row
         self.col = col
         self.spawn_time = spawn_time
         self.collected = False
         self.collected_by = 0
+        self.collect_time = 0.0
 
 
 class GridClashGame:
     """
-    Complete game logic for Grid Clash multiplayer game.
-    Updated rules:
-    1. Players can move through their OWN claimed cells
-    2. Players cannot move through OTHER players' claimed cells
-    3. Player outline shows when standing on claimed cell
-    4. Star event spawns every 3 seconds in empty accessible cells
-    5. Game ends when any player reaches 200 claimed blocks OR all cells claimed
+    Optimized game logic with caching and efficient state management
     """
 
     def __init__(self, grid_size: int = GRID_SIZE, seed: int = 42):
         self.grid_size = grid_size
         self.grid = [[0 for _ in range(grid_size)] for _ in range(grid_size)]
-        self.players: Dict[int, Tuple[int, int]] = {}  # player_id -> (row, col)
-        self.scores: Dict[int, int] = {}  # player_id -> score
+        self.players: Dict[int, Tuple[int, int]] = {}
+        self.scores: Dict[int, int] = {i: 0 for i in range(1, 5)}
         self.game_over = False
         self.winner: Optional[int] = None
-        self.win_reason = ""  # Track why game ended
+        self.win_reason = ""
         self.next_event_id = 1
 
-        # Event system (only STAR events now)
-        self.events: Dict[int, GameEvent] = {}  # event_id -> GameEvent
-        self.player_events: Dict[int, PlayerEvent] = {}  # player_id -> active PlayerEvent
+        # Event system
+        self.events: Dict[int, GameEvent] = {}
+        self.player_events: Dict[int, PlayerEvent] = {}
         self.last_event_spawn_time = time.time()
+        self.event_spawn_positions = set()
+
+        # State caching for delta encoding
+        self.last_grid_state = None
+        self.last_player_positions = {}
+        self.last_snapshot_hash = 0
+
+        # Movement validation cache
+        self.move_cache: Dict[Tuple[int, int, int], bool] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
 
         random.seed(seed)
 
-        # Initialize scores for all possible players
-        for i in range(1, 5):
-            self.scores[i] = 0
-
     def update_events(self):
-        """Update event states and check for expirations"""
+        """Update event states with time-based expiration"""
         current_time = time.time()
 
-        # Spawn new events every 3 seconds (always exactly 1 STAR event)
-        if current_time - self.last_event_spawn_time >= EVENT_SPAWN_INTERVAL:
-            self.spawn_events()
+        # Spawn new events
+        if (current_time - self.last_event_spawn_time >= EVENT_SPAWN_INTERVAL and
+                len(self.events) < MAX_EVENTS_ON_GRID):
+            self.spawn_event()
             self.last_event_spawn_time = current_time
 
-        # Check for event expirations on players
+        # Remove old uncollected events (5 minute lifetime)
+        events_to_remove = []
+        for event_id, event in self.events.items():
+            if (current_time - event.spawn_time > 300.0 and
+                    not event.collected):  # 5 minutes
+                events_to_remove.append(event_id)
+
+        for event_id in events_to_remove:
+            del self.events[event_id]
+            if (event.row, event.col) in self.event_spawn_positions:
+                self.event_spawn_positions.remove((event.row, event.col))
+
+        # Remove expired player events
         players_to_remove = []
         for player_id, player_event in self.player_events.items():
             if not player_event.is_active(current_time):
@@ -116,37 +137,36 @@ class GridClashGame:
         for player_id in players_to_remove:
             del self.player_events[player_id]
 
-    def spawn_events(self):
-        """Spawn exactly 1 STAR event at random empty accessible position"""
+    def spawn_event(self):
+        """Spawn a single event at random empty accessible position"""
         current_time = time.time()
 
-        # Find all empty accessible cells (not claimed and no player and no existing event)
+        # Find empty cells that don't have events or players
         empty_cells = []
         for i in range(self.grid_size):
             for j in range(self.grid_size):
-                # Check if cell is empty and no player on it
-                if self.grid[i][j] == 0:
-                    has_player = False
-                    for player_pos in self.players.values():
-                        if player_pos == (i, j):
-                            has_player = True
-                            break
-                    if not has_player:
-                        empty_cells.append((i, j))
+                if (self.grid[i][j] == 0 and
+                        (i, j) not in self.event_spawn_positions and
+                        not any(pos == (i, j) for pos in self.players.values())):
+                    empty_cells.append((i, j))
 
         if empty_cells:
             row, col = random.choice(empty_cells)
 
             event = GameEvent(
                 event_id=self.next_event_id,
-                event_type=EVENT_STAR,  # Always STAR event
+                event_type=EVENT_STAR,
                 row=row,
                 col=col,
                 spawn_time=current_time
             )
 
             self.events[self.next_event_id] = event
+            self.event_spawn_positions.add((row, col))
             self.next_event_id += 1
+
+            return event
+        return None
 
     def check_event_collision(self, player_id: int) -> Optional[GameEvent]:
         """Check if player is standing on an event"""
@@ -156,53 +176,43 @@ class GridClashGame:
         player_row, player_col = self.players[player_id]
 
         for event in self.events.values():
-            if not event.collected and event.row == player_row and event.col == player_col:
+            if (not event.collected and
+                    event.row == player_row and
+                    event.col == player_col):
                 return event
 
         return None
 
     def collect_event(self, player_id: int, event: GameEvent) -> dict:
-        """Player collects an event (only STAR events now)"""
+        """Player collects an event"""
+        current_time = time.time()
         event.collected = True
         event.collected_by = player_id
-
-        current_time = time.time()
-
-        if event.event_type == EVENT_STAR:
-            # Star: Can steal enemy blocks by moving over them for 3 seconds
-            expiration_time = current_time + EVENT_DURATION_STAR
-            self.player_events[player_id] = PlayerEvent(EVENT_STAR, expiration_time)
-            event_name = "Star"
-            effect = "Can steal enemy blocks by moving over them"
+        event.collect_time = current_time
 
         # Remove from active events
-        del self.events[event.event_id]
+        if (event.row, event.col) in self.event_spawn_positions:
+            self.event_spawn_positions.remove((event.row, event.col))
 
+        if event.event_type == EVENT_STAR:
+            expiration_time = current_time + EVENT_DURATION_STAR
+            self.player_events[player_id] = PlayerEvent(EVENT_STAR, expiration_time)
+
+        # Don't delete immediately for fade-out effect
         return {
             'event_id': event.event_id,
             'event_type': event.event_type,
-            'event_name': event_name,
             'player_id': player_id,
-            'effect': effect,
-            'expiration_time': expiration_time
+            'expiration_time': expiration_time if event.event_type == EVENT_STAR else 0
         }
 
     def get_player_cell_status(self, player_id: int) -> dict:
-        """
-        Get information about the cell a player is standing on.
-
-        Returns:
-            Dictionary with:
-            - 'is_claimed': bool
-            - 'owner': int (0 if unclaimed, player_id if claimed)
-            - 'is_own_cell': bool (True if player owns this cell)
-        """
+        """Get information about the cell a player is standing on"""
         if player_id not in self.players:
             return {'is_claimed': False, 'owner': 0, 'is_own_cell': False}
 
         row, col = self.players[player_id]
 
-        # Check bounds
         if not (0 <= row < self.grid_size and 0 <= col < self.grid_size):
             return {'is_claimed': False, 'owner': 0, 'is_own_cell': False}
 
@@ -215,98 +225,118 @@ class GridClashGame:
         }
 
     def add_player(self, player_id: int) -> bool:
-        """Add a new player to the game."""
+        """Add a new player to the game"""
         if player_id in self.players or self.game_over:
             return False
         if not 1 <= player_id <= 4:
             return False
 
-        # Find all unclaimed positions
-        unclaimed_positions = []
+        # Find all unclaimed positions not occupied by events
+        valid_positions = []
         for i in range(self.grid_size):
             for j in range(self.grid_size):
-                if self.grid[i][j] == 0:
-                    unclaimed_positions.append((i, j))
+                if (self.grid[i][j] == 0 and
+                        not any(event.row == i and event.col == j
+                                for event in self.events.values() if not event.collected)):
+                    valid_positions.append((i, j))
 
-        if not unclaimed_positions:
+        if not valid_positions:
             return False
 
-        # Place player on random unclaimed cell
-        row, col = random.choice(unclaimed_positions)
+        # Place player on random valid cell
+        row, col = random.choice(valid_positions)
         self.players[player_id] = (row, col)
-        self.scores[player_id] = 0
+        self.last_player_positions[player_id] = (row, col)
 
         return True
 
-    def move_player(self, player_id: int, direction: int) -> bool:
+    def move_player(self, player_id: int, direction: int) -> dict:
         """
-        Move a player in the given direction.
-        NEW RULE: Players can move through their OWN claimed cells.
-        SPECIAL EVENT: Star allows stealing enemy blocks.
+        Move a player with caching and event checking
+        Returns dict with move result and optional event collection
         """
         if player_id not in self.players or self.game_over:
-            return False
+            return {'success': False, 'event_collected': None}
 
         row, col = self.players[player_id]
 
+        # Check cache first
+        cache_key = (player_id, row, col, direction)
+        if cache_key in self.move_cache:
+            self.cache_hits += 1
+            if not self.move_cache[cache_key]:
+                return {'success': False, 'event_collected': None}
+        else:
+            self.cache_misses += 1
+
+        # Calculate new position
         new_row, new_col = self._calculate_move(row, col, direction)
 
-        # Check if move is valid (not out of bounds)
         if (new_row, new_col) == (row, col):
-            return False
+            self.move_cache[cache_key] = False
+            return {'success': False, 'event_collected': None}
 
-        # Check for event collisions BEFORE moving
-        # (Events are checked at the new position)
-        event_at_new_pos = None
-        for event in self.events.values():
-            if not event.collected and event.row == new_row and event.col == new_col:
-                event_at_new_pos = event
-                break
-
-        # Check if target cell is accessible
-        target_cell_owner = self.grid[new_row][new_col]
-
-        move_allowed = False
+        # Check movement validity
+        target_owner = self.grid[new_row][new_col]
+        can_move = False
         steal_cell = False
 
-        if target_cell_owner == 0:  # Unclaimed cell - always allowed
-            move_allowed = True
-        elif target_cell_owner == player_id:  # Player's own claimed cell - allowed
-            move_allowed = True
-        else:  # Other player's claimed cell
-            # Check if player has star event (can steal by moving over)
-            if player_id in self.player_events:
-                if self.player_events[player_id].event_type == EVENT_STAR:
-                    move_allowed = True
-                    steal_cell = True
-            else:
-                move_allowed = False
+        if target_owner == 0:
+            can_move = True
+        elif target_owner == player_id:
+            can_move = True
+        elif player_id in self.player_events:
+            if self.player_events[player_id].event_type == EVENT_STAR:
+                can_move = True
+                steal_cell = True
 
-        if move_allowed:
-            # Update player position
-            old_row, old_col = row, col
-            self.players[player_id] = (new_row, new_col)
+        if not can_move:
+            self.move_cache[cache_key] = False
+            return {'success': False, 'event_collected': None}
 
-            # Handle cell stealing if applicable
-            if steal_cell and target_cell_owner != 0:
-                # Steal the cell from other player
-                old_owner = self.grid[new_row][new_col]
-                self.grid[new_row][new_col] = player_id
-                self.scores[player_id] += 1
-                if old_owner in self.scores:
-                    self.scores[old_owner] = max(0, self.scores[old_owner] - 1)
+        # Update player position
+        old_row, old_col = row, col
+        self.players[player_id] = (new_row, new_col)
 
-            # Check if game is over after move
-            if self._is_game_over():
-                self.game_over = True
-                self.winner, self.win_reason = self._calculate_winner()
+        # Check for event collision at new position
+        event_collected = None
+        event = self.check_event_collision(player_id)
+        if event:
+            event_collected = self.collect_event(player_id, event)
 
-            return True
+        # Handle cell stealing
+        if steal_cell and target_owner != 0:
+            old_owner = self.grid[new_row][new_col]
+            self.grid[new_row][new_col] = player_id
+            self.scores[player_id] += 1
+            if old_owner in self.scores:
+                self.scores[old_owner] = max(0, self.scores[old_owner] - 1)
 
-        return False
+        # Update cache
+        self.move_cache[cache_key] = True
+
+        # Check game over
+        if self._is_game_over():
+            self.game_over = True
+            self.winner, self.win_reason = self._calculate_winner()
+
+        # Prune cache if too large
+        if len(self.move_cache) > MOVE_CACHE_SIZE:
+            # Remove oldest entries
+            keys = list(self.move_cache.keys())
+            for key in keys[:MOVE_CACHE_SIZE // 2]:
+                del self.move_cache[key]
+
+        return {
+            'success': True,
+            'old_position': (old_row, old_col),
+            'new_position': (new_row, new_col),
+            'event_collected': event_collected,
+            'steal_cell': steal_cell
+        }
 
     def claim_cell(self, player_id: int) -> dict:
-        """Player attempts to claim the cell they're standing on."""
+        """Player attempts to claim the cell they're standing on"""
         if player_id not in self.players or self.game_over:
             return self._create_claim_result(False, (0, 0))
 
@@ -317,163 +347,143 @@ class GridClashGame:
             self.grid[row][col] = player_id
             self.scores[player_id] += 1
 
-            # Check if game is over (score reached 200)
+            # Check if game is over
             if self._is_game_over():
                 self.game_over = True
                 self.winner, self.win_reason = self._calculate_winner()
                 return self._create_claim_result(
-                    True, (row, col), True, self.winner, self._get_scores_array(), self.win_reason
+                    True, (row, col), True, self.winner,
+                    self._get_scores_array(), self.win_reason
                 )
             else:
                 return self._create_claim_result(True, (row, col))
         else:
             # Cell already claimed
             if self.grid[row][col] == player_id:
-                return self._create_claim_result(True, (row, col), message="Already your cell")
+                return self._create_claim_result(True, (row, col),
+                                                 message="Already your cell")
             else:
-                return self._create_claim_result(False, (row, col), message="Cell claimed by another player")
+                return self._create_claim_result(False, (row, col),
+                                                 message="Cell claimed by another player")
 
-    def get_grid_bytes(self) -> bytes:
-        """Serialize grid to bytes for network transmission."""
-        return bytes([self.grid[i][j] for i in range(self.grid_size)
-                      for j in range(self.grid_size)])
+    def get_compressed_snapshot(self, last_snapshot_hash: int = 0) -> bytes:
+        """
+        Get compressed snapshot with delta encoding
+        Returns (is_compressed, payload)
+        """
+        # Calculate current hash
+        current_hash = self._calculate_state_hash()
 
-    def get_positions_bytes(self) -> bytes:
-        """Serialize player positions to bytes for network transmission."""
-        positions_bytes = bytes([len(self.players)])
-        for pid, (row, col) in self.players.items():
-            positions_bytes += bytes([pid, row, col])
-        return positions_bytes
+        # If state hasn't changed, send minimal payload
+        if current_hash == last_snapshot_hash:
+            return (False, struct.pack('B', 0))  # No change marker
 
-    def get_events_bytes(self) -> bytes:
-        """Serialize active events to bytes for network transmission."""
+        # Get delta from last state
+        grid_delta, positions_delta = self._get_state_delta()
+
+        # Build payload
+        payload = struct.pack('B', 1)  # Changed flag
+
+        # Grid delta
+        payload += struct.pack('H', len(grid_delta))
+        for row, col, value in grid_delta:
+            payload += struct.pack('BBB', row, col, value)
+
+        # Positions delta
+        payload += struct.pack('B', len(positions_delta))
+        for pid, (row, col) in positions_delta.items():
+            payload += struct.pack('BBB', pid, row, col)
+
+        # Active events
         active_events = [e for e in self.events.values() if not e.collected]
-        events_bytes = bytes([len(active_events)])
-
+        payload += struct.pack('B', len(active_events))
         for event in active_events:
-            events_bytes += bytes([
-                event.event_id,
-                event.event_type,
-                event.row,
-                event.col
-            ])
+            payload += struct.pack('BBBB', event.event_id, event.event_type,
+                                   event.row, event.col)
 
-        return events_bytes
+        # Player events
+        current_time = time.time()
+        payload += struct.pack('B', len(self.player_events))
+        for pid, pevent in self.player_events.items():
+            remaining_ms = int(pevent.get_remaining_time(current_time) * 1000)
+            payload += struct.pack('BB', pid, pevent.event_type)
+            payload += struct.pack('>I', remaining_ms)
 
-    def get_player_events_bytes(self) -> bytes:
-        """Serialize player active events to bytes."""
-        events_bytes = bytes([len(self.player_events)])
+        # Scores (only changed ones)
+        score_changes = []
+        for pid, score in self.scores.items():
+            if pid not in self.last_player_positions or score != self.scores.get(pid, 0):
+                score_changes.append((pid, score))
 
-        for player_id, player_event in self.player_events.items():
-            # Calculate remaining time in milliseconds
-            current_time = time.time()
-            remaining_ms = max(0, int((player_event.expiration_time - current_time) * 1000))
+        payload += struct.pack('B', len(score_changes))
+        for pid, score in score_changes:
+            payload += struct.pack('BB', pid, min(score, 255))
 
-            events_bytes += bytes([
-                player_id,
-                player_event.event_type
-            ])
-            events_bytes += struct.pack('>I', remaining_ms)  # 4 bytes for remaining time
+        # Compress if payload is large
+        if len(payload) > 100:
+            compressed = zlib.compress(payload, level=1)
+            if len(compressed) < len(payload) * 0.8:  # Only compress if significant savings
+                return (True, compressed)
 
-        return events_bytes
+        return (False, payload)
 
-    def get_snapshot_payload(self) -> bytes:
-        """Get complete snapshot payload for broadcasting (with events)."""
-        return (
-                self.get_grid_bytes() +
-                self.get_positions_bytes() +
-                self.get_events_bytes() +
-                self.get_player_events_bytes()
-        )
+    def update_from_delta(self, delta_data: bytes) -> bool:
+        """Update game state from delta snapshot"""
+        try:
+            if len(delta_data) < 1:
+                return False
 
-    def update_from_snapshot(self, grid_bytes: bytes, positions_bytes: bytes) -> bool:
-        """Update game state from received snapshot (client-side)."""
-        # Validate input sizes
-        expected_grid_size = self.grid_size * self.grid_size
-        if len(grid_bytes) < expected_grid_size:
-            return False
+            changed_flag = struct.unpack('B', delta_data[:1])[0]
+            if changed_flag == 0:
+                return True  # No changes
 
-        # Update grid (first part of payload)
-        grid_bytes_part = grid_bytes[:expected_grid_size]
-        for i in range(self.grid_size):
-            for j in range(self.grid_size):
-                self.grid[i][j] = grid_bytes_part[i * self.grid_size + j]
-
-        # Update player positions
-        if len(positions_bytes) < 1:
-            return False
-
-        num_players = positions_bytes[0]
-        pos_idx = 1
-        self.players.clear()
-
-        for _ in range(num_players):
-            if pos_idx + 2 >= len(positions_bytes):
-                break
-            pid = positions_bytes[pos_idx]
-            row = positions_bytes[pos_idx + 1]
-            col = positions_bytes[pos_idx + 2]
-            if 1 <= pid <= 4 and 0 <= row < self.grid_size and 0 <= col < self.grid_size:
-                self.players[pid] = (row, col)
-            pos_idx += 3
-
-        # Recalculate scores
-        self._recalculate_scores()
-
-        # Check game over
-        if not self.game_over:
-            self.game_over = self._is_game_over()
-            if self.game_over:
-                self.winner, self.win_reason = self._calculate_winner()
-
-        return True
-
-    def update_events_from_snapshot(self, events_bytes: bytes, player_events_bytes: bytes) -> bool:
-        """Update events from snapshot (client-side)."""
-        # Parse events on grid
-        if len(events_bytes) > 0:
-            num_events = events_bytes[0]
             idx = 1
-            self.events.clear()
 
-            for _ in range(num_events):
-                if idx + 3 >= len(events_bytes):
+            # Grid delta
+            if idx + 2 > len(delta_data):
+                return False
+            num_grid_changes = struct.unpack('H', delta_data[idx:idx + 2])[0]
+            idx += 2
+
+            for _ in range(num_grid_changes):
+                if idx + 3 > len(delta_data):
                     break
-                event_id = events_bytes[idx]
-                event_type = events_bytes[idx + 1]
-                row = events_bytes[idx + 2]
-                col = events_bytes[idx + 3]
-
+                row, col, value = struct.unpack('BBB', delta_data[idx:idx + 3])
                 if 0 <= row < self.grid_size and 0 <= col < self.grid_size:
-                    event = GameEvent(event_id, event_type, row, col, time.time())
-                    self.events[event_id] = event
+                    self.grid[row][col] = value
+                idx += 3
 
-                idx += 4
+            # Positions delta
+            if idx + 1 > len(delta_data):
+                return False
+            num_position_changes = delta_data[idx]
+            idx += 1
 
-        # Parse player events
-        if len(player_events_bytes) > 0:
-            num_player_events = player_events_bytes[0]
-            idx = 1
-            self.player_events.clear()
-
-            for _ in range(num_player_events):
-                if idx + 5 >= len(player_events_bytes):
+            for _ in range(num_position_changes):
+                if idx + 3 > len(delta_data):
                     break
-                player_id = player_events_bytes[idx]
-                event_type = player_events_bytes[idx + 1]
-                remaining_ms = struct.unpack('>I', player_events_bytes[idx + 2:idx + 6])[0]
+                pid, row, col = struct.unpack('BBB', delta_data[idx:idx + 3])
+                if 1 <= pid <= 4 and 0 <= row < self.grid_size and 0 <= col < self.grid_size:
+                    self.players[pid] = (row, col)
+                idx += 3
 
-                expiration_time = time.time() + (remaining_ms / 1000.0)
-                self.player_events[player_id] = PlayerEvent(event_type, expiration_time)
+            # Recalculate scores
+            self._recalculate_scores()
 
-                idx += 6
+            # Check game over
+            if not self.game_over:
+                self.game_over = self._is_game_over()
+                if self.game_over:
+                    self.winner, self.win_reason = self._calculate_winner()
 
-        return True
+            return True
+        except:
+            return False
 
     def get_state(self) -> dict:
-        """Get current game state for client rendering."""
+        """Get current game state for client rendering"""
         return {
-            'grid': [row[:] for row in self.grid],  # Deep copy
+            'grid': [row[:] for row in self.grid],
             'players': self.players.copy(),
             'scores': self.scores.copy(),
             'events': {eid: {
@@ -493,23 +503,25 @@ class GridClashGame:
         }
 
     def reset(self) -> None:
-        """Reset game to initial state."""
+        """Reset game to initial state"""
         self.grid = [[0 for _ in range(self.grid_size)] for _ in range(self.grid_size)]
         self.players.clear()
-        self.scores.clear()
-        for i in range(1, 5):
-            self.scores[i] = 0
+        self.scores = {i: 0 for i in range(1, 5)}
         self.game_over = False
         self.winner = None
         self.win_reason = ""
         self.events.clear()
         self.player_events.clear()
+        self.event_spawn_positions.clear()
         self.next_event_id = 1
         self.last_event_spawn_time = time.time()
+        self.move_cache.clear()
+        self.last_grid_state = None
+        self.last_player_positions.clear()
+        self.last_snapshot_hash = 0
 
     # Private helper methods
     def _calculate_move(self, row: int, col: int, direction: int) -> Tuple[int, int]:
-        """Calculate new position based on direction."""
         if direction == DIRECTIONS['UP'] and row > 0:
             return (row - 1, col)
         elif direction == DIRECTIONS['DOWN'] and row < self.grid_size - 1:
@@ -521,13 +533,12 @@ class GridClashGame:
         return (row, col)
 
     def _is_game_over(self) -> bool:
-        """Check if game is over: any player reached 200 blocks OR all cells claimed."""
-        # Check if any player reached MAX_SCORE_TO_WIN
-        for pid, score in self.scores.items():
+        # Check max score
+        for score in self.scores.values():
             if score >= MAX_SCORE_TO_WIN:
                 return True
 
-        # Check if all cells are claimed
+        # Check all cells claimed
         for row in self.grid:
             for cell in row:
                 if cell == 0:
@@ -535,13 +546,12 @@ class GridClashGame:
         return True
 
     def _calculate_winner(self) -> Tuple[int, str]:
-        """Calculate winner and reason."""
-        # First check if someone reached 200 blocks
+        # Check for max score win
         for pid, score in self.scores.items():
             if score >= MAX_SCORE_TO_WIN:
                 return pid, f"Reached {MAX_SCORE_TO_WIN} blocks!"
 
-        # Otherwise, winner is player with highest score
+        # Highest score win
         max_score = -1
         winner = 0
         for pid, score in self.scores.items():
@@ -552,30 +562,25 @@ class GridClashGame:
         return winner, "All cells claimed"
 
     def _get_scores_array(self) -> List[int]:
-        """Get scores as array indexed by player ID."""
-        scores_arr = [0] * 5  # Index 0-4
+        scores_arr = [0] * 5
         for pid, score in self.scores.items():
-            scores_arr[pid] = score
+            scores_arr[pid] = min(score, 255)
         return scores_arr
 
     def _recalculate_scores(self) -> None:
-        """Recalculate scores from current grid state."""
-        # Reset scores
-        for pid in self.scores:
-            self.scores[pid] = 0
-
-        # Count claimed cells
+        # Recalculate from grid
+        temp_scores = {i: 0 for i in range(1, 5)}
         for row in self.grid:
             for cell in row:
                 if 1 <= cell <= 4:
-                    self.scores[cell] += 1
+                    temp_scores[cell] += 1
+        self.scores = temp_scores
 
     def _create_claim_result(self, success: bool, position: Tuple[int, int],
                              game_over: bool = False, winner: int = 0,
                              scores: Optional[List[int]] = None,
                              win_reason: str = "",
                              message: str = "") -> dict:
-        """Helper to create standardized claim result dict."""
         result = {
             'success': success,
             'position': position,
@@ -588,25 +593,71 @@ class GridClashGame:
             result['scores'] = scores or self._get_scores_array()
         return result
 
+    def _calculate_state_hash(self) -> int:
+        """Calculate hash of current game state for delta encoding"""
+        import hashlib
+        h = hashlib.md5()
+
+        # Hash grid
+        for row in self.grid:
+            h.update(bytes(row))
+
+        # Hash player positions
+        for pid in sorted(self.players.keys()):
+            row, col = self.players[pid]
+            h.update(bytes([pid, row, col]))
+
+        # Hash scores
+        for pid in sorted(self.scores.keys()):
+            h.update(bytes([pid, self.scores[pid] & 0xFF]))
+
+        return int.from_bytes(h.digest()[:4], 'little')
+
+    def _get_state_delta(self):
+        """Get changes since last state"""
+        grid_delta = []
+        positions_delta = {}
+
+        # Compare with last known state
+        if self.last_grid_state:
+            for i in range(self.grid_size):
+                for j in range(self.grid_size):
+                    if self.grid[i][j] != self.last_grid_state[i][j]:
+                        grid_delta.append((i, j, self.grid[i][j]))
+        else:
+            # First time, mark all as changed
+            for i in range(self.grid_size):
+                for j in range(self.grid_size):
+                    grid_delta.append((i, j, self.grid[i][j]))
+
+        # Player positions
+        for pid, pos in self.players.items():
+            last_pos = self.last_player_positions.get(pid)
+            if last_pos != pos:
+                positions_delta[pid] = pos
+
+        # Update cached state
+        self.last_grid_state = [row[:] for row in self.grid]
+        self.last_player_positions = self.players.copy()
+        self.last_snapshot_hash = self._calculate_state_hash()
+
+        return grid_delta, positions_delta
+
     # Static utility methods
     @staticmethod
     def calculate_position_error(pos1: Tuple[float, float], pos2: Tuple[float, float]) -> float:
-        """Calculate Euclidean distance between two positions."""
         return ((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2) ** 0.5
 
     @staticmethod
     def interpolate_position(current: Tuple[float, float], target: Tuple[float, float],
                              speed: float, dt: float) -> Tuple[float, float]:
-        """Smoothly interpolate from current to target position."""
         curr_row, curr_col = current
         target_row, target_col = target
 
-        # Interpolate row
         if curr_row != target_row:
             step = min(speed * dt, abs(curr_row - target_row))
             curr_row += step * (1 if target_row > curr_row else -1)
 
-        # Interpolate column
         if curr_col != target_col:
             step = min(speed * dt, abs(curr_col - target_col))
             curr_col += step * (1 if target_col > curr_col else -1)
@@ -615,36 +666,27 @@ class GridClashGame:
 
     @staticmethod
     def get_color(player_id: int) -> Tuple[int, int, int]:
-        """Get RGB color for a player ID."""
         return COLORS.get(player_id, (255, 255, 255))
 
     @staticmethod
     def get_outline_color(player_id: int) -> Tuple[int, int, int]:
-        """Get outline color for a player ID (darker version)."""
         return OUTLINE_COLORS.get(player_id, (150, 150, 150))
 
     @staticmethod
     def get_event_color(event_type: int) -> Tuple[int, int, int]:
-        """Get RGB color for an event type."""
         return EVENT_COLORS.get(event_type, (255, 255, 255))
 
     @staticmethod
     def should_draw_outline(player_row: int, player_col: int, grid: List[List[int]],
                             player_id: int) -> bool:
-        """
-        Determine if a player should have an outline drawn.
-        Outline shows when player is standing on a claimed cell.
-        """
         if not (0 <= player_row < len(grid) and 0 <= player_col < len(grid[0])):
             return False
 
         cell_owner = grid[player_row][player_col]
-        # Draw outline if standing on any claimed cell (including own)
         return cell_owner != 0
 
     @staticmethod
     def get_event_name(event_type: int) -> str:
-        """Get display name for event type."""
         if event_type == EVENT_STAR:
             return "Star"
         return "Unknown"
