@@ -1,0 +1,29 @@
+/mnt/d/Kareem/downloads/Network Project 33/Network Project/venv/lib/python3.12/site-packages/pygame/pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.3)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+2025-12-12 04:20:32,568 - [CLIENT ???] Connecting to ('127.0.0.1', 1234)...
+2025-12-12 04:20:32,572 - [CLIENT 001] Successfully connected! Assigned Player ID: 1
+2025-12-12 04:20:32,675 - [CLIENT 001] Packet error: 'GridClashGame' object has no attribute 'GameEvent'
+2025-12-12 04:20:33,045 - [CLIENT 001] Successfully claimed block at (0, 12)
+2025-12-12 04:20:34,110 - [CLIENT 001] Successfully claimed block at (0, 12)
+2025-12-12 04:20:35,388 - [CLIENT 001] Successfully claimed block at (0, 12)
+2025-12-12 04:20:36,630 - [CLIENT 001] Successfully claimed block at (0, 13)
+2025-12-12 04:20:36,938 - [CLIENT 001] Successfully claimed block at (0, 13)
+2025-12-12 04:20:37,985 - [CLIENT 001] Successfully claimed block at (1, 13)
+2025-12-12 04:20:40,663 - [CLIENT 001] Successfully claimed block at (0, 12)
+2025-12-12 04:20:41,775 - [CLIENT 001] Successfully claimed block at (0, 11)
+2025-12-12 04:20:45,233 - [CLIENT 001] Successfully claimed block at (2, 11)
+2025-12-12 04:20:45,669 - [CLIENT 001] Successfully claimed block at (0, 11)
+2025-12-12 04:20:46,907 - [CLIENT 001] Successfully claimed block at (0, 12)
+2025-12-12 04:20:51,548 - [CLIENT 001] Successfully claimed block at (1, 16)
+2025-12-12 04:20:54,901 - [CLIENT 001] Successfully claimed block at (0, 13)
+2025-12-12 04:20:56,561 - [CLIENT 001] Successfully claimed block at (1, 12)
+2025-12-12 04:20:57,138 - [CLIENT 001] Successfully claimed block at (1, 12)
+2025-12-12 04:20:59,036 - [CLIENT 001] Successfully claimed block at (1, 10)
+2025-12-12 04:21:00,993 - [CLIENT 001] You collected a SPECIAL BOOST (Type 1)!
+2025-12-12 04:21:01,432 - [CLIENT 001] Successfully claimed block at (2, 10)
+2025-12-12 04:21:04,439 - [CLIENT 001] Successfully claimed block at (2, 9)
+2025-12-12 04:21:06,630 - [CLIENT 001] Successfully claimed block at (3, 9)
+2025-12-12 04:21:09,102 - [CLIENT 001] Successfully claimed block at (2, 11)
+2025-12-12 04:21:09,739 - [CLIENT 001] Successfully claimed block at (2, 11)
