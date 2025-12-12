@@ -187,32 +187,30 @@ This analyzes logs and generates:
 - **STAR Power-up**: Collect gold star, temporarily steal enemy cells by moving over them
 - **Win Conditions**: First to 200 points OR all cells claimed
 
-## **Data Flow**
+## Data Flow Diagram
 
+```mermaid
+graph TD
+    subgraph Client Node
+        Input[User Input] -->|Immediate| P_State[Predicted State]
+        Input -->|UDP Packet| Net_Out[Network Output]
+        Net_In[Network Input] -->|Snapshot| R_State[Reconciliation Logic]
+        R_State --> P_State
+        P_State --> Render[PyGame Renderer]
+    end
+
+    subgraph Server Node
+        S_Net_In[Network Input] -->|Move Command| G_Logic[Game Logic]
+        G_Logic -->|Update Grid| Auth_State[Authoritative State]
+        Auth_State -->|Delta Compression| Snap[Snapshot Generator]
+        Snap -->|UDP Broadcast| S_Net_Out[Network Output]
+    end
+
+    Net_Out -.->|Latency/Jitter| S_Net_In
+    S_Net_Out -.->|Packet Loss| Net_In
 ```
-┌─────────┐    UDP Packets    ┌─────────┐
-│ Client  │◄─────────────────►│ Server  │
-│         │   Game Updates    │         │
-└────┬────┘                   └────┬────┘
-     │                              │
-     ▼                              ▼
-┌─────────┐                   ┌─────────┐
-│  Logs:  │                   │  Logs:  │
-│ • Position │                   │ • Auth Pos │
-│ • Metrics  │                   │ • Metrics  │
-└─────────┘                   └─────────┘
-                                    │
-                               ┌────▼────┐
-                               │ Analysis│
-                               │ Script  │
-                               └────┬────┘
-                                    │
-                               ┌────▼────┐
-                               │ Graphs  │
-                               │ • Error │
-                               │ • Latency│
-                               └─────────┘
-```
+
+-----
 
 ## **Performance Optimization Techniques**
 
@@ -255,50 +253,21 @@ This analyzes logs and generates:
 3. **Statistical Analysis**: Mean, median, percentile calculations
 4. **Trend Identification**: Error vs update rate correlation
 
-## **File Structure**
+## Project Structure
 
+```text
+/
+├── baseline.py          # Orchestrator for running experiments
+├── client.py            # Game client (PyGame, Prediction)
+├── common.py            # Config, Constants, Protocol headers
+├── game.py              # Core Logic (Movement, Collision, Events)
+├── process_logs.py      # Data Analysis & Plotting
+├── server.py            # UDP Server & State Authority
+├── server_log.txt       # Runtime logs
+├── *.csv                # Generated metric data
+└── *.png                # Generated analysis graphs
 ```
-GUDP_Project/
-├── core/
-│   ├── server.py              # Main server implementation
-│   ├── client.py              # Client with visualization
-│   ├── game.py               # Game logic and state management
-│   └── common.py             # Protocol constants and utilities
-├── automation/
-│   ├── baseline.py           # Auto-start server + clients
-│   └── process_logs.py       # Data analysis and visualization
-├── logs/                     # Generated during execution
-│   ├── server_log.txt
-│   ├── server_position_log.csv
-│   ├── server_metrics.csv
-│   ├── client_*_position_log.csv
-│   └── client_*_metrics.csv
-├── results/                  # Analysis outputs
-│   ├── error_vs_rate.png
-│   ├── latency_analysis.png
-│   └── experiment_history.csv
-└── README.md                # This file
-```
-
-## **Academic and Research Applications**
-
-This project serves as an excellent platform for studying:
-
-1. **Networked Game Architecture**: Real-time synchronization challenges
-2. **Protocol Design**: Custom UDP protocol vs TCP vs WebSockets
-3. **Prediction/Reconciliation**: Client-side prediction algorithms
-4. **Quality of Service**: Impact of latency, jitter, packet loss
-5. **Compression Techniques**: Delta encoding vs full state updates
-6. **Scalability**: Server load with increasing player counts
-
-## **Future Enhancements**
-
-1. **Network Emulation**: Integration with NetEm for controlled impairment testing
-2. **More Game Features**: Additional power-ups, team modes, larger grids
-3. **Web Interface**: Browser-based client with WebRTC or WebSockets
-4. **Cloud Deployment**: Multi-region server deployment for latency studies
-5. **Machine Learning**: Predictive models for optimal update rates
-6. **Security Features**: Encryption, anti-cheat, authentication
+---
 
 ## **Troubleshooting**
 
@@ -314,18 +283,6 @@ Set verbose logging in each component:
 - Server: Add `self.log(f"Debug: {msg}")` calls
 - Client: Enable detailed packet logging in `handle_packet()`
 - Game: Monitor prediction/reconciliation events
-
-## **Citation & Credits**
-
-This project demonstrates principles from:
-- **Gaffer on Games** (Glenn Fiedler) - Networked physics and prediction
-- **Valve's Source Multiplayer Networking** - Server-authoritative architecture
-- **Quake III Networking** - Client-side prediction and interpolation
-- **League of Legends Networking** - Lockstep and rollback techniques
-
-## **License**
-
-This project is for educational and research purposes. All code is provided as-is for academic study of networked game systems.
 
 ---
 
