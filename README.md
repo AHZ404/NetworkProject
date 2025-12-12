@@ -287,5 +287,5 @@ Set verbose logging in each component:
 ---
 
 **Project Maintainer**: Networked Systems Research Group  
-**Last Updated**: December 2024  
+**Last Updated**: December 2025
 **Version**: 2.0 (GUDP Protocol v2)
