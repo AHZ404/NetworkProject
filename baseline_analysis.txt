@@ -1,24 +1,31 @@
 === GUDP Performance Analysis ===
 
 [Position Error Analysis]
-  Mean Error:          0.0403 cells
+  Mean Error:          0.2435 cells
   Median Error:        0.0000 cells
-  95th Percentile Error: 0.3417 cells
-  Total Samples:       3539
+  95th Percentile Error: 0.9331 cells
+  Total Samples:       3849
 
 [Latency Analysis]
-  Mean:            2.66 ms
+  Mean:            3.90 ms
   Median:          1.00 ms
-  95th Percentile: 2.00 ms
-  Max:             120.00 ms
+  95th Percentile: 3.35 ms
+  Max:             152.00 ms
   Saved 'latency_analysis.png'
 
 [Jitter Analysis]
-  Mean:            1.96 ms
-  Median:          1.38 ms
-  95th Percentile: 5.75 ms
-  Max:             26.00 ms
+  Mean:            3.70 ms
+  Median:          0.87 ms
+  95th Percentile: 35.55 ms
+  Max:             39.50 ms
 
-[Experiment] Saved result: 30 Hz -> 0.0403 error
+[Experiment] Saved result: 30 Hz -> 0.2435 error
 [Experiment] History saved to 'experiment_history.csv'
 [Plotting] Graph updated: 'error_vs_rate.png'
+
+========================================
+       ADDITIONAL SYSTEM METRICS        
+========================================
+Average CPU Usage:       2.16667%
+Average Network Latency: 0.031 ms
+========================================
