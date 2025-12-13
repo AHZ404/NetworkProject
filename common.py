@@ -28,7 +28,7 @@ MSG_TYPES = {
 }
 
 # Network settings
-UPDATE_HZ = 30
+UPDATE_HZ = 90
 UPDATE_INTERVAL = 1.0 / UPDATE_HZ
 HOST = '127.0.0.1'
 PORT = 1234

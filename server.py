@@ -5,6 +5,7 @@ import struct
 import threading
 import zlib
 import csv
+import os
 from datetime import datetime
 from typing import Dict, Tuple, Any
 
@@ -31,6 +32,12 @@ class ClientInfo:
 
 class Server:
     def __init__(self):
+        # Create Output Directories
+        if not os.path.exists('Logs'):
+            os.makedirs('Logs')
+        if not os.path.exists('Metrics'):
+            os.makedirs('Metrics')
+
         # UDP Socket Only
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -61,17 +68,17 @@ class Server:
             'bytes_sent': 0, 'bytes_received': 0,
         }
 
-        # Logging
-        self.log_file = open('server_log.txt', 'w', encoding='utf-8', errors='replace')
+        # Logging -> Logs/server_log.txt
+        self.log_file = open(os.path.join('Logs', 'server_log.txt'), 'w', encoding='utf-8', errors='replace')
 
-        # Metrics
-        self.metrics_file = open('server_metrics.csv', 'w', newline='')
+        # Metrics -> Metrics/server_metrics.csv
+        self.metrics_file = open(os.path.join('Metrics', 'server_metrics.csv'), 'w', newline='')
         self.csv_writer = csv.writer(self.metrics_file)
         self.csv_writer.writerow(['timestamp', 'cpu_percent', 'clients_connected',
                                   'packets_sent', 'packets_received', 'bandwidth_kbps'])
 
-        # --- NEW: Position Logging for "Perceived Error" Analysis ---
-        self.pos_log_file = open('server_position_log.csv', 'w', newline='')
+        # Position Logging -> Logs/server_position_log.csv
+        self.pos_log_file = open(os.path.join('Logs', 'server_position_log.csv'), 'w', newline='')
         self.pos_writer = csv.writer(self.pos_log_file)
         # Writes authoritative position: Time, PlayerID, Row, Col
         self.pos_writer.writerow(['time', 'player_id', 'row', 'col'])

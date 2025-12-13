@@ -9,6 +9,7 @@ import random
 import pygame
 import zlib
 import csv
+import os
 from datetime import datetime
 from collections import deque
 from common import *
@@ -17,6 +18,12 @@ from game import GridClashGame
 
 class Client:
     def __init__(self, host=HOST, port=PORT, auto=False, client_name=None):
+        # Create Output Directories
+        if not os.path.exists('Logs'):
+            os.makedirs('Logs')
+        if not os.path.exists('Metrics'):
+            os.makedirs('Metrics')
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
@@ -26,8 +33,8 @@ class Client:
 
         self.server_addr = (host, port)
 
-        # LOGGING (Thread-Safe)
-        self.log_file = open('client_log.txt', 'w')
+        # LOGGING (Thread-Safe) -> Logs/client_log.txt
+        self.log_file = open(os.path.join('Logs', 'client_log.txt'), 'w')
         self.log_lock = threading.Lock()
 
         self.game = GridClashGame()
@@ -265,12 +272,16 @@ class Client:
                     # --- LOG ACTION: Connected ---
                     self.log(f"Successfully connected! Assigned Player ID: {self.player_id}", prefix="[CONN]")
 
-                    self.position_log = open(f'client_{self.player_id}_position_log.csv', 'w', newline='')
+                    # Position Log -> Logs/client_N_position_log.csv
+                    self.position_log = open(os.path.join('Logs', f'client_{self.player_id}_position_log.csv'), 'w',
+                                             newline='')
                     self.pos_writer = csv.writer(self.position_log)
                     self.pos_writer.writerow(
                         ['time', 'snapshot_id', 'player_id', 'server_row', 'server_col', 'display_row', 'display_col'])
 
-                    self.metric_file = open(f'client_{self.player_id}_metrics.csv', 'w', newline='')
+                    # Metrics -> Metrics/client_N_metrics.csv
+                    self.metric_file = open(os.path.join('Metrics', f'client_{self.player_id}_metrics.csv'), 'w',
+                                            newline='')
                     self.metric_writer = csv.writer(self.metric_file)
                     self.metric_writer.writerow(
                         ['timestamp', 'client_id', 'snapshot_id', 'seq_num', 'server_timestamp_ms', 'recv_time_ms',
