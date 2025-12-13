@@ -85,10 +85,22 @@ class Server:
     def _get_timestamp(self):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
 
-    def log(self, msg, prefix="[SERVER]"):
+    def log(self, msg, prefix="[SERVER]", snapshot_id=None, seq_num=None):
         timestamp = self._get_timestamp()
+
+        # Default to current server snapshot if not provided
+        if snapshot_id is None:
+            snapshot_id = self.snapshot_id
+
+        # Build the extra context string
+        # Shows: [Snap: #] [Seq: #]
+        context_str = f"[Snap: {snapshot_id}]"
+        if seq_num is not None:
+            context_str += f" [Seq: {seq_num}]"
+
         safe_msg = ''.join(char for char in str(msg) if ord(char) < 128)
-        full_msg = f"{timestamp} - {prefix} {safe_msg}"
+        full_msg = f"{timestamp} - {prefix} {context_str} {safe_msg}"
+
         print(full_msg)
         self.log_file.write(full_msg + "\n")
         self.log_file.flush()
@@ -146,18 +158,19 @@ class Server:
         compressed = zlib.compress(bytes(payload), level=1)
         return compressed
 
-    def handle_connect(self, addr):
+    def handle_connect(self, addr, seq_num=None):
         with self.clients_lock:
             if addr in self.clients:
                 client = self.clients[addr]
                 payload = struct.pack('BB', client.player_id, self.game.grid_size)
                 self.send_packet_safe(addr, MSG_TYPES['WELCOME'], 0, 0, payload)
                 # --- LOG ACTION: Re-Connection ---
-                self.log(f"Client re-connected (Player {client.player_id}) from {addr}", prefix="[RECONNECT]")
+                self.log(f"Client re-connected (Player {client.player_id}) from {addr}",
+                         prefix="[RECONNECT]", seq_num=seq_num)
                 return
 
             if len(self.clients) >= 4:
-                self.log(f"Server full, rejecting: {addr}", prefix="[WARN]")
+                self.log(f"Server full, rejecting: {addr}", prefix="[WARN]", seq_num=seq_num)
                 return
 
             player_id = None
@@ -173,7 +186,8 @@ class Server:
                 self.clients[addr] = client_info
                 self.player_to_addr[player_id] = addr
                 # --- LOG ACTION: Connection & Joining ---
-                self.log(f"New connection accepted. Assigned Player ID {player_id} to {addr}", prefix="[CONNECT]")
+                self.log(f"New connection accepted. Assigned Player ID {player_id} to {addr}",
+                         prefix="[CONNECT]", seq_num=seq_num)
             else:
                 return
 
@@ -256,7 +270,7 @@ class Server:
         try:
             header = parse_header(data[:HEADER_SIZE])
             if not header: return
-            _, _, msg_type, snapshot_id, _, timestamp, payload_len, checksum = header
+            _, _, msg_type, snapshot_id, seq_num, timestamp, payload_len, checksum = header
             payload = data[HEADER_SIZE:]
             if len(payload) != payload_len or compute_checksum(payload) != checksum: return
 
@@ -264,8 +278,9 @@ class Server:
                 payload = zlib.decompress(payload)
                 msg_type = MSG_TYPES['SNAPSHOT']
 
+            # Pass seq_num to connect handler
             if msg_type == MSG_TYPES['CONNECT']:
-                self.handle_connect(addr)
+                self.handle_connect(addr, seq_num)
                 return
 
             with self.clients_lock:
@@ -278,9 +293,11 @@ class Server:
 
             if msg_type == MSG_TYPES['MOVE']:
                 if len(payload) == 1:
-                    self.handle_move(client.player_id, struct.unpack('B', payload)[0])
+                    # Pass seq_num to move handler
+                    self.handle_move(client.player_id, struct.unpack('B', payload)[0], seq_num)
             elif msg_type == MSG_TYPES['CLAIM']:
-                self.handle_claim(client.player_id, addr)
+                # Pass seq_num to claim handler
+                self.handle_claim(client.player_id, addr, seq_num)
             elif msg_type == MSG_TYPES['HEARTBEAT']:
                 self.send_packet_safe(addr, MSG_TYPES['HEARTBEAT'], 0, client.sequence_counter)
                 client.sequence_counter += 1
@@ -290,32 +307,34 @@ class Server:
         except Exception:
             pass
 
-    def handle_move(self, player_id, direction):
+    def handle_move(self, player_id, direction, seq_num=None):
         result = self.game.move_player(player_id, direction)
 
         if result['success']:
             # --- LOG ACTION: Change of client position ---
             old_pos = result['old_position']
             new_pos = result['new_position']
-            self.log(f"Player {player_id} moved from {old_pos} to {new_pos}", prefix="[MOVE]")
+            self.log(f"Player {player_id} moved from {old_pos} to {new_pos}",
+                     prefix="[MOVE]", seq_num=seq_num)
 
             if result.get('event_collected'):
                 ed = result['event_collected']
                 # --- LOG ACTION: Client got special boost ---
                 self.log(f"Player {player_id} collected BOOST (Type {ed['event_type']}) at {new_pos}!",
-                         prefix="[BOOST]")
+                         prefix="[BOOST]", seq_num=seq_num)
 
                 pl = struct.pack('BBBB', ed['event_id'], ed['event_type'], player_id, 0)
                 self.broadcast_message_to_all(MSG_TYPES['EVENT_COLLECT'], pl)
 
-    def handle_claim(self, player_id, addr):
+    def handle_claim(self, player_id, addr, seq_num=None):
         result = self.game.claim_cell(player_id)
         msg_type = MSG_TYPES['ACK'] if result['success'] else MSG_TYPES['NACK']
         row, col = result['position']
 
         if result['success']:
             # --- LOG ACTION: Client claim a block ---
-            self.log(f"Player {player_id} successfully CLAIMED block at ({row}, {col})", prefix="[CLAIM]")
+            self.log(f"Player {player_id} successfully CLAIMED block at ({row}, {col})",
+                     prefix="[CLAIM]", seq_num=seq_num)
 
         with self.clients_lock:
             client = self.clients.get(addr)
