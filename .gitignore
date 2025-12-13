@@ -1,7 +1,9 @@
-
 # Python
 venv/
 .venv/
 __pycache__/
 *.pyc
 
+# RFC documents
+Mini RFC.docx
+Mini RFC.pdf
