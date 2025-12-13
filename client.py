@@ -447,8 +447,12 @@ class Client:
                 time.sleep(1)
                 continue
 
-            time.sleep(random.uniform(0.3, 0.8))
-            if random.random() < 0.7:
+            # --- MODIFIED: FASTER BOT MOVEMENT ---
+            # Reduced sleep to 0.05-0.1s (10-20 Hz) to ensure continuous movement
+            time.sleep(random.uniform(0.05, 0.1))
+
+            # Increased move probability to 90% to avoid standing still
+            if random.random() < 0.9:
                 self.seq_num += 1
                 d = random.choice([0, 1, 2, 3])
                 self.send_message(MSG_TYPES['MOVE'], 0, self.seq_num, struct.pack('B', d))
