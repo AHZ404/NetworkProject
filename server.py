@@ -82,11 +82,16 @@ class Server:
         # --- LOG ACTION: Listening ---
         self.log(f"Server initialized. Listening on port {PORT}...", prefix="[STARTUP]")
 
-    def _get_timestamp(self):
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
-
     def log(self, msg, prefix="[SERVER]", snapshot_id=None, seq_num=None):
-        timestamp = self._get_timestamp()
+        # 1. Capture exact time once
+        current_time = time.time()
+
+        # 2. Format Human Readable: 2025-12-13 12:30:21,561
+        dt = datetime.fromtimestamp(current_time)
+        timestamp_str = dt.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+
+        # 3. Format Float: 1765621821.104530
+        timestamp_float = f"{current_time:.6f}"
 
         # Default to current server snapshot if not provided
         if snapshot_id is None:
@@ -99,7 +104,9 @@ class Server:
             context_str += f" [Seq: {seq_num}]"
 
         safe_msg = ''.join(char for char in str(msg) if ord(char) < 128)
-        full_msg = f"{timestamp} - {prefix} {context_str} {safe_msg}"
+
+        # 4. Construct Final String: Readable -- Float -- Prefix ...
+        full_msg = f"{timestamp_str} -- {timestamp_float} -- {prefix} {context_str} {safe_msg}"
 
         print(full_msg)
         self.log_file.write(full_msg + "\n")
