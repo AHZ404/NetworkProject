@@ -208,6 +208,25 @@ def analyze_server_metrics():
                 print(f"  Mean Bandwidth:     {valid_bw.mean():.2f} kbps")
                 print(f"  Max Bandwidth:      {valid_bw.max():.2f} kbps")
 
+                # Plot server bandwidth over time
+                plt.figure(figsize=(12, 6))
+
+                if 'relative_time' in server_df.columns:
+                    plt.plot(server_df['relative_time'], valid_bw,
+                             color='orange', linewidth=1.5, alpha=0.8)
+                    plt.xlabel('Time (seconds)')
+                else:
+                    plt.plot(valid_bw.index, valid_bw,
+                             color='orange', linewidth=1.5, alpha=0.8)
+                    plt.xlabel('Sample Index')
+
+                plt.ylabel('Bandwidth (kbps)')
+                plt.title(f'Server Bandwidth Usage Over Time (Update Rate: {UPDATE_HZ} Hz)')
+                plt.grid(True, alpha=0.3)
+                plt.ylim(bottom=0)
+                plt.savefig('server_bandwidth_usage.png')
+                print(f"  Saved 'server_bandwidth_usage.png'")
+
         # Client Connections Analysis
         if 'clients_connected' in server_df.columns:
             clients_data = server_df['clients_connected']
@@ -235,6 +254,8 @@ def analyze_metrics():
 
     if metrics_data:
         all_metrics = pd.concat(metrics_data, ignore_index=True)
+
+        # Latency Analysis
         valid_latency = all_metrics[all_metrics['latency_ms'] > 0]['latency_ms']
 
         if not valid_latency.empty:
@@ -244,27 +265,208 @@ def analyze_metrics():
             print(f"  95th Percentile: {valid_latency.quantile(0.95):.2f} ms")
             print(f"  Max:             {valid_latency.max():.2f} ms")
 
-            plt.figure(figsize=(10, 6))
-            for pid in all_metrics['player_id'].unique():
+            # Plot latency over time for each client
+            plt.figure(figsize=(12, 6))
+            colors = ['blue', 'green', 'red', 'purple']
+
+            for idx, pid in enumerate(sorted(all_metrics['player_id'].unique())):
                 subset = all_metrics[(all_metrics['player_id'] == pid) & (all_metrics['latency_ms'] > 0)]
-                plt.plot(subset['snapshot_id'], subset['latency_ms'], label=f'P{pid}')
+                if not subset.empty:
+                    color = colors[idx % len(colors)]
+                    plt.plot(subset['snapshot_id'], subset['latency_ms'],
+                             label=f'P{pid}', color=color, linewidth=1.5, alpha=0.8)
 
             plt.xlabel('Snapshot ID')
             plt.ylabel('Latency (ms)')
-            plt.title('Latency over Time')
+            plt.title(f'Latency over Time (Update Rate: {UPDATE_HZ} Hz)')
             plt.legend()
             plt.grid(True, alpha=0.3)
+            plt.ylim(bottom=0)
             plt.savefig('latency_analysis.png')
             print("  Saved 'latency_analysis.png'")
 
+            # Create a bar chart of average latency per client
+            plt.figure(figsize=(10, 6))
+            avg_latency_per_client = []
+            client_ids = []
+
+            for pid in sorted(all_metrics['player_id'].unique()):
+                client_latency = all_metrics[(all_metrics['player_id'] == pid) &
+                                             (all_metrics['latency_ms'] > 0)]['latency_ms']
+                if not client_latency.empty:
+                    avg_latency_per_client.append(client_latency.mean())
+                    client_ids.append(f'P{pid}')
+
+            if avg_latency_per_client:
+                bars = plt.bar(client_ids, avg_latency_per_client,
+                               color=colors[:len(client_ids)])
+                plt.xlabel('Client')
+                plt.ylabel('Average Latency (ms)')
+                plt.title(f'Average Client Latency (Update Rate: {UPDATE_HZ} Hz)')
+                plt.grid(True, alpha=0.3, axis='y')
+
+                # Add value labels on top of bars
+                for bar in bars:
+                    height = bar.get_height()
+                    plt.text(bar.get_x() + bar.get_width() / 2., height,
+                             f'{height:.1f}', ha='center', va='bottom')
+
+                plt.savefig('client_latency_average.png')
+                print("  Saved 'client_latency_average.png'")
+
+        # Jitter Analysis
         if 'jitter_ms' in all_metrics.columns:
-            valid_jitter = all_metrics['jitter_ms'].dropna()
+            # Convert jitter to numeric
+            all_metrics['jitter_ms'] = pd.to_numeric(all_metrics['jitter_ms'], errors='coerce')
+            valid_jitter = all_metrics[all_metrics['jitter_ms'] > 0]['jitter_ms']
+
             if not valid_jitter.empty:
                 print(f"\n[Jitter Analysis]")
-                print(f"  Mean:            {valid_jitter.mean():.2f} ms")
-                print(f"  Median:          {valid_jitter.median():.2f} ms")
-                print(f"  95th Percentile: {valid_jitter.quantile(0.95):.2f} ms")
-                print(f"  Max:             {valid_jitter.max():.2f} ms")
+                print(f"  Overall Mean:            {valid_jitter.mean():.2f} ms")
+                print(f"  Overall Median:          {valid_jitter.median():.2f} ms")
+                print(f"  Overall 95th Percentile: {valid_jitter.quantile(0.95):.2f} ms")
+                print(f"  Overall Max:             {valid_jitter.max():.2f} ms")
+
+                # Calculate jitter statistics for each client
+                for pid in all_metrics['player_id'].unique():
+                    client_jitter = all_metrics[(all_metrics['player_id'] == pid) &
+                                                (all_metrics['jitter_ms'] > 0)]['jitter_ms']
+                    if not client_jitter.empty:
+                        print(f"\n  Player {pid}:")
+                        print(f"    Mean:            {client_jitter.mean():.2f} ms")
+                        print(f"    Median:          {client_jitter.median():.2f} ms")
+                        print(f"    Max:             {client_jitter.max():.2f} ms")
+                        print(f"    Samples:         {len(client_jitter)}")
+
+                # Plot jitter over time for each client
+                plt.figure(figsize=(12, 6))
+                colors = ['blue', 'green', 'red', 'purple']
+
+                for idx, pid in enumerate(sorted(all_metrics['player_id'].unique())):
+                    subset = all_metrics[(all_metrics['player_id'] == pid) &
+                                         (all_metrics['jitter_ms'] > 0)]
+                    if not subset.empty:
+                        color = colors[idx % len(colors)]
+                        plt.plot(subset['snapshot_id'], subset['jitter_ms'],
+                                 label=f'P{pid}', color=color, linewidth=1.5, alpha=0.8)
+
+                plt.xlabel('Snapshot ID')
+                plt.ylabel('Jitter (ms)')
+                plt.title(f'Jitter over Time (Update Rate: {UPDATE_HZ} Hz)')
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.ylim(bottom=0)
+                plt.savefig('jitter_analysis.png')
+                print("  Saved 'jitter_analysis.png'")
+
+                # Create a bar chart of average jitter per client
+                plt.figure(figsize=(10, 6))
+                avg_jitter_per_client = []
+                client_ids = []
+
+                for pid in sorted(all_metrics['player_id'].unique()):
+                    client_jitter = all_metrics[(all_metrics['player_id'] == pid) &
+                                                (all_metrics['jitter_ms'] > 0)]['jitter_ms']
+                    if not client_jitter.empty:
+                        avg_jitter_per_client.append(client_jitter.mean())
+                        client_ids.append(f'P{pid}')
+
+                if avg_jitter_per_client:
+                    bars = plt.bar(client_ids, avg_jitter_per_client,
+                                   color=colors[:len(client_ids)])
+                    plt.xlabel('Client')
+                    plt.ylabel('Average Jitter (ms)')
+                    plt.title(f'Average Client Jitter (Update Rate: {UPDATE_HZ} Hz)')
+                    plt.grid(True, alpha=0.3, axis='y')
+
+                    # Add value labels on top of bars
+                    for bar in bars:
+                        height = bar.get_height()
+                        plt.text(bar.get_x() + bar.get_width() / 2., height,
+                                 f'{height:.2f}', ha='center', va='bottom')
+
+                    plt.savefig('client_jitter_average.png')
+                    print("  Saved 'client_jitter_average.png'")
+        else:
+            print("\n[Jitter Analysis]")
+            print("  Note: 'jitter_ms' column not found in client metrics.")
+            print("  Make sure clients are calculating and logging jitter.")
+
+        # Bandwidth Analysis for each client
+        if 'bandwidth_per_client_kbps' in all_metrics.columns:
+            # Remove any non-numeric values
+            all_metrics['bandwidth_per_client_kbps'] = pd.to_numeric(
+                all_metrics['bandwidth_per_client_kbps'], errors='coerce'
+            )
+            valid_bw = all_metrics[all_metrics['bandwidth_per_client_kbps'] > 0]
+
+            if not valid_bw.empty:
+                print(f"\n[Client Bandwidth Analysis]")
+
+                # Calculate statistics for each client
+                for pid in valid_bw['player_id'].unique():
+                    client_bw = valid_bw[valid_bw['player_id'] == pid]['bandwidth_per_client_kbps']
+                    if not client_bw.empty:
+                        print(f"  Player {pid}:")
+                        print(f"    Mean:     {client_bw.mean():.2f} kbps")
+                        print(f"    Median:   {client_bw.median():.2f} kbps")
+                        print(f"    Max:      {client_bw.max():.2f} kbps")
+                        print(f"    Samples:  {len(client_bw)}")
+
+                # Plot bandwidth over time for each client
+                plt.figure(figsize=(12, 6))
+                colors = ['blue', 'green', 'red', 'purple']
+
+                for idx, pid in enumerate(sorted(valid_bw['player_id'].unique())):
+                    subset = valid_bw[valid_bw['player_id'] == pid]
+                    if not subset.empty:
+                        color = colors[idx % len(colors)]
+                        plt.plot(subset['snapshot_id'], subset['bandwidth_per_client_kbps'],
+                                 label=f'P{pid}', color=color, linewidth=1.5, alpha=0.8)
+
+                plt.xlabel('Snapshot ID')
+                plt.ylabel('Bandwidth (kbps)')
+                plt.title(f'Client Bandwidth Usage Over Time (Update Rate: {UPDATE_HZ} Hz)')
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.ylim(bottom=0)
+                plt.savefig('client_bandwidth_usage.png')
+                print("  Saved 'client_bandwidth_usage.png'")
+
+                # Create a bar chart of average bandwidth per client
+                plt.figure(figsize=(10, 6))
+                avg_bw_per_client = []
+                client_ids = []
+
+                for pid in sorted(valid_bw['player_id'].unique()):
+                    client_bw = valid_bw[valid_bw['player_id'] == pid]['bandwidth_per_client_kbps']
+                    if not client_bw.empty:
+                        avg_bw_per_client.append(client_bw.mean())
+                        client_ids.append(f'P{pid}')
+
+                if avg_bw_per_client:
+                    bars = plt.bar(client_ids, avg_bw_per_client, color=colors[:len(client_ids)])
+                    plt.xlabel('Client')
+                    plt.ylabel('Average Bandwidth (kbps)')
+                    plt.title(f'Average Client Bandwidth Usage (Update Rate: {UPDATE_HZ} Hz)')
+                    plt.grid(True, alpha=0.3, axis='y')
+
+                    # Add value labels on top of bars
+                    for bar in bars:
+                        height = bar.get_height()
+                        plt.text(bar.get_x() + bar.get_width() / 2., height,
+                                 f'{height:.1f}', ha='center', va='bottom')
+
+                    plt.savefig('client_bandwidth_average.png')
+                    print("  Saved 'client_bandwidth_average.png'")
+            else:
+                print("\n[Client Bandwidth Analysis]")
+                print("  No bandwidth data found (all values are 0).")
+                print("  This is normal for localhost testing.")
+        else:
+            print("\n[Client Bandwidth Analysis]")
+            print("  Note: 'bandwidth_per_client_kbps' column not found in client metrics.")
+            print("  Make sure clients are logging bandwidth data.")
 
 
 if __name__ == '__main__':
