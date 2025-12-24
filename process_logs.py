@@ -135,6 +135,90 @@ def analyze_position_errors():
         return None
 
 
+def analyze_server_metrics():
+    """Analyze server CPU usage and other metrics."""
+    if not os.path.exists('server_metrics.csv'):
+        print("[Server Analysis] 'server_metrics.csv' not found.")
+        return
+
+    try:
+        server_df = pd.read_csv('server_metrics.csv')
+
+        # Convert timestamp to relative time for easier plotting
+        if 'timestamp' in server_df.columns:
+            # Convert to numeric if it's string
+            if server_df['timestamp'].dtype == 'object':
+                server_df['timestamp'] = pd.to_numeric(server_df['timestamp'], errors='coerce')
+
+            # Calculate relative time in seconds
+            if not server_df['timestamp'].isnull().all():
+                min_time = server_df['timestamp'].min()
+                server_df['relative_time'] = server_df['timestamp'] - min_time
+
+        print(f"\n[Server Metrics Analysis]")
+        print(f"  Total samples: {len(server_df)}")
+
+        # CPU Analysis
+        if 'cpu_percent' in server_df.columns:
+            cpu_data = pd.to_numeric(server_df['cpu_percent'], errors='coerce')
+            valid_cpu = cpu_data.dropna()
+
+            if not valid_cpu.empty:
+                print(f"\n[CPU Usage Analysis]")
+                print(f"  Mean CPU:           {valid_cpu.mean():.2f}%")
+                print(f"  Median CPU:         {valid_cpu.median():.2f}%")
+                print(f"  Max CPU:            {valid_cpu.max():.2f}%")
+                print(f"  Min CPU:            {valid_cpu.min():.2f}%")
+                print(f"  95th Percentile:    {valid_cpu.quantile(0.95):.2f}%")
+
+                # Plot CPU over time
+                plt.figure(figsize=(12, 6))
+
+                if 'relative_time' in server_df.columns:
+                    plt.plot(server_df['relative_time'], valid_cpu,
+                             color='red', linewidth=1.5, alpha=0.8)
+                    plt.xlabel('Time (seconds)')
+                else:
+                    plt.plot(valid_cpu.index, valid_cpu,
+                             color='red', linewidth=1.5, alpha=0.8)
+                    plt.xlabel('Sample Index')
+
+                plt.ylabel('CPU Usage (%)')
+                plt.title(f'Server CPU Usage Over Time (Update Rate: {UPDATE_HZ} Hz)')
+                plt.grid(True, alpha=0.3)
+                plt.ylim(bottom=0)
+
+                # Add horizontal lines for mean and median
+                plt.axhline(y=valid_cpu.mean(), color='blue', linestyle='--',
+                            linewidth=1, alpha=0.7, label=f'Mean: {valid_cpu.mean():.1f}%')
+                plt.axhline(y=valid_cpu.median(), color='green', linestyle=':',
+                            linewidth=1, alpha=0.7, label=f'Median: {valid_cpu.median():.1f}%')
+
+                plt.legend()
+                plt.savefig('server_cpu_usage.png')
+                print(f"  Saved 'server_cpu_usage.png'")
+
+        # Bandwidth Analysis
+        if 'bandwidth_kbps' in server_df.columns:
+            bw_data = pd.to_numeric(server_df['bandwidth_kbps'], errors='coerce')
+            valid_bw = bw_data.dropna()
+
+            if not valid_bw.empty:
+                print(f"\n[Bandwidth Analysis]")
+                print(f"  Mean Bandwidth:     {valid_bw.mean():.2f} kbps")
+                print(f"  Max Bandwidth:      {valid_bw.max():.2f} kbps")
+
+        # Client Connections Analysis
+        if 'clients_connected' in server_df.columns:
+            clients_data = server_df['clients_connected']
+            print(f"\n[Client Connections]")
+            print(f"  Max Clients:        {clients_data.max()}")
+            print(f"  Min Clients:        {clients_data.min()}")
+
+    except Exception as e:
+        print(f"Error analyzing server metrics: {e}")
+
+
 def analyze_metrics():
     """Analyze latency and jitter from client logs and plot results."""
     metrics_data = []
@@ -192,7 +276,10 @@ if __name__ == '__main__':
     # 2. Analyze Latency for CURRENT logs
     analyze_metrics()
 
-    # 3. If we successfully calculated error, save it to history and update graph
+    # 3. Analyze Server Metrics (CPU, Bandwidth, etc.)
+    analyze_server_metrics()
+
+    # 4. If we successfully calculated error, save it to history and update graph
     if mean_error is not None:
         save_experiment_result(mean_error)
         plot_experiment_trends()
