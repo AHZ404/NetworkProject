@@ -8,7 +8,7 @@ GUDP is a sophisticated network gaming simulation framework that implements a cu
 
 ## **Demo Video Link**
 
-![Grid Clash Demo](https://drive.google.com/file/d/1Kugvzer4QX9O3yfkdaz2hlo2g_nUn8qi/view?usp=drive_link)
+![Grid Clash Demo](https://drive.google.com/file/d/1Kugvzer4QX9O3yfkdaz2hlo2g_nUn8qi/view?usp=sharing)
 
 -----
 
@@ -309,5 +309,6 @@ Set verbose logging in each component:
 **Project Maintainer**: Networked Systems Research Group  
 **Last Updated**: December 2025  
 **Version**: 2.0 (GUDP Protocol v2)
+
 
 
