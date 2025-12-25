@@ -7,14 +7,13 @@ import zlib
 import csv
 from datetime import datetime
 from typing import Dict, Tuple, Any
+from common import *
+from game import GridClashGame
 
 try:
     import psutil
 except ImportError:
     psutil = None
-
-from common import *
-from game import GridClashGame
 
 
 class ClientInfo:

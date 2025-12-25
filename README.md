@@ -4,6 +4,14 @@
 
 GUDP is a sophisticated network gaming simulation framework that implements a custom UDP-based protocol for multiplayer games. This project demonstrates **real-time networked game architecture** with focus on network optimization, prediction, reconciliation, and quantitative performance analysis. It simulates a competitive "Grid Clash" game where 4 players compete to claim territory on a 20×20 grid while collecting power-ups.
 
+-----
+
+## **Demo Video Link**
+
+![Grid Clash Demo](https://drive.google.com/file/d/1Kugvzer4QX9O3yfkdaz2hlo2g_nUn8qi/view?usp=drive_link)
+
+-----
+
 ## **Core Architecture**
 
 ### **Protocol Design**
@@ -61,6 +69,8 @@ GUDP is a sophisticated network gaming simulation framework that implements a cu
 - **`process_logs.py`**: Advanced data analysis and visualization
 - **Experiment Tracking**: Historical performance across different update rates
 
+-----
+
 ## **Network Protocol Details**
 
 ### **Packet Header Format**
@@ -97,6 +107,8 @@ Total: 28 bytes
 14: FULL_SNAPSHOT    - Complete state for new clients
 ```
 
+-----
+
 ## **Performance Analysis Framework**
 
 ### **Quantitative Metrics Collected**
@@ -122,6 +134,8 @@ Total: 28 bytes
 1. **`error_vs_rate.png`**: Position error vs update rate graph
 2. **`latency_analysis.png`**: Latency trends over time per player
 3. **Console Statistics**: Comprehensive performance summary
+
+-----
 
 ## **Setup and Usage**
 
@@ -160,6 +174,8 @@ This analyzes logs and generates:
 - Latency/jitter analysis
 - Updated performance graphs
 - Historical experiment tracking
+
+-----
 
 ## **Key Features in Detail**
 
@@ -232,6 +248,8 @@ graph TD
 3. **Client State Tracking**: Per-client snapshot acknowledgment
 4. **Memory Management**: Limited history buffer (5 seconds)
 
+-----
+
 ## **Experimental Framework**
 
 ### **Controlled Variables**
@@ -253,6 +271,8 @@ graph TD
 3. **Statistical Analysis**: Mean, median, percentile calculations
 4. **Trend Identification**: Error vs update rate correlation
 
+-----
+
 ## Project Structure
 
 ```text
@@ -267,7 +287,7 @@ graph TD
 ├── *.csv                # Generated metric data
 └── *.png                # Generated analysis graphs
 ```
----
+-----
 
 ## **Troubleshooting**
 
@@ -284,7 +304,7 @@ Set verbose logging in each component:
 - Client: Enable detailed packet logging in `handle_packet()`
 - Game: Monitor prediction/reconciliation events
 
----
+-----
 
 **Project Maintainer**: Networked Systems Research Group  
 **Last Updated**: December 2025  

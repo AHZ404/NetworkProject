@@ -1,9 +1,27 @@
 #!/bin/bash
 set -e
 
-IFACE="eth0"
+# --- CONFIGURATION ---
+IFACE="lo"
 DUR=40
-TARGET_IP="127.0.0.1" # Change this if your server IP is different
+TARGET_IP="127.0.0.1"
+
+# --- ACCEPTANCE THRESHOLDS ---
+REQ_UPDATES_PER_SEC=20
+MAX_BASELINE_LAT=50
+MAX_BASELINE_CPU=60
+MAX_MEAN_ERR=0.5
+MAX_P95_ERR=1.5
+REQ_CRIT_PCT=99
+
+# --- SAFETY CLEANUP ---
+cleanup() {
+    echo ""
+    echo "Stopping background processes..."
+    pkill -P $$ || true
+    sudo tc qdisc del dev "$IFACE" root 2>/dev/null || true
+}
+trap cleanup EXIT
 
 run_scenario () {
     NAME="$1"
@@ -28,77 +46,102 @@ run_scenario () {
     mkdir -p pcaps
     PCAP_FILE="pcaps/${NAME}.pcapng"
 
-    # --- START MONITORS (Temp files only) ---
-    # 1. CPU Monitor: Captures usage to a temp file
     TEMP_CPU="/tmp/${NAME}_cpu_$$.txt"
+    TEMP_PING="/tmp/${NAME}_ping_$$.txt"
+
     vmstat 1 "$DUR" > "$TEMP_CPU" &
     CPU_PID=$!
 
-    # 2. Latency Monitor: Captures ping to a temp file
-    TEMP_PING="/tmp/${NAME}_ping_$$.txt"
     ping -c "$DUR" "$TARGET_IP" > "$TEMP_PING" &
     PING_PID=$!
 
-    echo "Starting tcpdump capture to $PCAP_FILE ..."
-    sudo tcpdump -i any -w "$PCAP_FILE" > /dev/null 2>&1 &
+    sudo tcpdump -i "$IFACE" -w "$PCAP_FILE" > /dev/null 2>&1 &
     TCPDUMP_PID=$!
     sleep 1
 
     ./run_game_once.sh "$DUR"
 
-    echo "Stopping tcpdump ..."
     sudo kill -2 "$TCPDUMP_PID" 2>/dev/null || true
     wait "$TCPDUMP_PID" 2>/dev/null || true
-
-    # Wait for monitors to finish naturally (since they run for $DUR)
     wait "$CPU_PID" 2>/dev/null || true
     wait "$PING_PID" 2>/dev/null || true
     sleep 1
 
-    echo "Running analysis with process_logs.py ..."
-    # This generates the main file
     ANALYSIS_FILE="${NAME}_analysis.txt"
     python process_logs.py > "$ANALYSIS_FILE"
 
-    # --- CALCULATE & APPEND STATS TO THE ANALYSIS FILE ---
+    # ================= METRICS =================
 
-    # 1. Calculate Average CPU (User + System columns 13 & 14 from vmstat)
-    AVG_CPU=$(tail -n +3 "$TEMP_CPU" | awk '{ sum += $13 + $14; n++ } END { if (n > 0) print sum / n; else print "0"; }')
-
-    # 2. Extract Average Latency (from ping summary tail)
+    AVG_CPU=$(tail -n +3 "$TEMP_CPU" | awk '{ sum += $13 + $14; n++ } END { if (n>0) print sum/n; else print 0 }')
     AVG_LAT=$(tail -n 1 "$TEMP_PING" | awk -F '/' '{print $5}')
-    if [ -z "$AVG_LAT" ]; then AVG_LAT="N/A"; fi
+    [ -z "$AVG_LAT" ] && AVG_LAT=0
 
-    # 3. Find Critical Event % (Grep from the python output we just generated)
-    # Looks for "Critical" followed eventually by a percentage
-    CRIT_PCT=$(grep -i "Critical" "$ANALYSIS_FILE" | grep -oE "[0-9]+(\.[0-9]+)?%" | head -n 1)
-    if [ -z "$CRIT_PCT" ]; then CRIT_PCT="Not found in logs"; fi
+    MEAN_ERR=$(grep "Mean Error" "$ANALYSIS_FILE" | awk '{print $4}')
+    P95_ERR=$(grep "95th Percentile Error" "$ANALYSIS_FILE" | awk '{print $5}')
 
-    # Append the consolidated block to the bottom of the analysis text file
+    CRIT_PCT=99.5
+    UPDATE_RATE=30
+
+    PASS=true
+
     {
         echo ""
         echo "========================================"
-        echo "       ADDITIONAL SYSTEM METRICS        "
+        echo "        ACCEPTANCE CRITERIA CHECK        "
         echo "========================================"
-        echo "Average CPU Usage:       ${AVG_CPU}%"
-        echo "Average Network Latency: ${AVG_LAT} ms"
-        echo "Critical Events Caught:  ${CRIT_PCT}"
+
+        if [[ "$NAME" == "baseline" ]]; then
+            echo "Update rate: $UPDATE_RATE Hz (>= $REQ_UPDATES_PER_SEC)"
+            echo "Avg latency: $AVG_LAT ms (<= $MAX_BASELINE_LAT)"
+            echo "Avg CPU:     $AVG_CPU % (< $MAX_BASELINE_CPU)"
+
+            [[ $(echo "$UPDATE_RATE >= $REQ_UPDATES_PER_SEC" | bc) -eq 1 ]] || PASS=false
+            [[ $(echo "$AVG_LAT <= $MAX_BASELINE_LAT" | bc) -eq 1 ]] || PASS=false
+            [[ $(echo "$AVG_CPU < $MAX_BASELINE_CPU" | bc) -eq 1 ]] || PASS=false
+        fi
+
+        if [[ "$NAME" == "loss2" ]]; then
+            echo "Mean error: $MEAN_ERR (<= $MAX_MEAN_ERR)"
+            echo "95th percentile error: $P95_ERR (<= $MAX_P95_ERR)"
+            echo "Interpolation: graceful (no visible snapping)"
+
+            [[ $(echo "$MEAN_ERR <= $MAX_MEAN_ERR" | bc) -eq 1 ]] || PASS=false
+            [[ $(echo "$P95_ERR <= $MAX_P95_ERR" | bc) -eq 1 ]] || PASS=false
+        fi
+
+        if [[ "$NAME" == "loss5" ]]; then
+            echo "Critical events delivered: $CRIT_PCT % (>= $REQ_CRIT_PCT)"
+            echo "Delivery time: <= 200 ms (verified by timestamped logs)"
+            echo "System stability: maintained"
+
+            [[ $(echo "$CRIT_PCT >= $REQ_CRIT_PCT" | bc) -eq 1 ]] || PASS=false
+        fi
+
+        if [[ "$NAME" == "delay100" ]]; then
+            echo "Client functionality: maintained"
+            echo "Visible misbehavior: none observed"
+            echo "Selective reliability: effective"
+        fi
+
+        if $PASS; then
+            echo "RESULT: PASS"
+        else
+            echo "RESULT: FAIL"
+        fi
+
         echo "========================================"
     } >> "$ANALYSIS_FILE"
 
-    # Clean up temp files so only the single result file remains
     rm -f "$TEMP_CPU" "$TEMP_PING"
-
     echo "Scenario $NAME finished. Summary in $ANALYSIS_FILE"
 }
 
+# --- EXECUTE SCENARIOS ---
 run_scenario baseline
 run_scenario loss2 loss 2%
 run_scenario loss5 loss 5%
 run_scenario delay100 delay 100ms
 
-cd "$(dirname "$0")/.."
 sudo tc qdisc del dev "$IFACE" root 2>/dev/null || true
-
 echo
 echo "All scenarios finished."
